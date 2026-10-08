@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for CLI lookup and future configuration.
 - Dependency-aware choice fields with generic loading feedback, refresh and
   submission revalidation, exact output values, and visible retryable failures.
+- Namespaced, string-valued workflow configuration exposed to workflow and choice
+  commands through `HERDR_WORKFLOW_CONFIG_*` environment variables.
 
 ## [0.3.0] - 2026-07-10
 

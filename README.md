@@ -42,12 +42,21 @@ When the binary runs outside Herdr, it falls back to
 ```toml
 # "split" (default) or "overlay"
 placement = "overlay"
+
+[workflows.greet]
+profile = "personal"
 ```
 
 An absent file defaults to a split pane. Invalid TOML or any placement other
 than `split` or `overlay` opens a safe split pane containing the config path
 and error; normal workflows cannot run from that diagnostic screen. Close and
 reopen Launcher after changing the file.
+
+Each `[workflows.<namespace>]` table contains string values exposed to matching
+workflows as `$HERDR_WORKFLOW_CONFIG_<KEY>`. By default, the namespace is the
+workflow's stable `name`; set `config_namespace` in a workflow when several
+workflows should share one table. Config keys must be lowercase ASCII shell
+identifiers and are uppercased in the environment.
 
 ## The picker
 
@@ -64,6 +73,7 @@ A workflow is a `.toml` file — either `name.toml` directly, or a self-containe
 ```toml
 name = "greet"
 title = "Say Hello" # optional display label; `name` remains the CLI identifier
+# config_namespace = "greetings" # optional shared [workflows.greetings] config
 description = "Prints a greeting"
 # Field values are passed via $HERDR_FIELD_<name> (never interpolated into the
 # shell — no injection). $HERDR_WORKFLOW_DIR points at this workflow's folder.

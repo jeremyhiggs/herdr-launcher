@@ -6,7 +6,7 @@
 //   herdr-launcher __snapshot      (render the TUI to text via TestBackend — for demos/tests)
 // Workflows: *.toml in $HERDR_WORKFLOWS_DIR and ~/.config/herdr-launcher/workflows/.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsStr;
 use std::fmt;
@@ -50,6 +50,8 @@ impl Placement {
 struct LauncherConfig {
     #[serde(default)]
     placement: Placement,
+    #[serde(default)]
+    workflows: HashMap<String, HashMap<String, String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -97,10 +99,48 @@ fn load_config_from(path: Option<&Path>) -> Result<LauncherConfig, LauncherConfi
             });
         }
     };
-    toml::from_str(&text).map_err(|error| LauncherConfigError {
+    let config = toml::from_str(&text).map_err(|error| LauncherConfigError {
         path: path.to_path_buf(),
         detail: format!("{error}; placement must be 'split' or 'overlay'"),
+    })?;
+    validate_workflow_config(&config).map_err(|detail| LauncherConfigError {
+        path: path.to_path_buf(),
+        detail,
+    })?;
+    Ok(config)
+}
+
+fn valid_config_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(character) if character == '_' || character.is_ascii_lowercase() => {}
+        _ => return false,
+    }
+    chars.all(|character| {
+        character == '_' || character.is_ascii_lowercase() || character.is_ascii_digit()
     })
+}
+
+fn validate_workflow_config(config: &LauncherConfig) -> Result<(), String> {
+    for (namespace, values) in &config.workflows {
+        let mut projected = HashSet::new();
+        for key in values.keys() {
+            let environment_key = key.to_ascii_uppercase();
+            if !projected.insert(environment_key.clone()) {
+                return Err(format!(
+                    "workflow config keys in namespace '{namespace}' collide as HERDR_WORKFLOW_CONFIG_{environment_key}"
+                ));
+            }
+        }
+        for key in values.keys() {
+            if !valid_config_key(key) {
+                return Err(format!(
+                    "workflow config key '{key}' in namespace '{namespace}' must be a lowercase ASCII shell identifier"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn load_config() -> Result<LauncherConfig, LauncherConfigError> {
@@ -173,12 +213,16 @@ struct Workflow {
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
+    config_namespace: Option<String>,
+    #[serde(default)]
     description: String,
     #[serde(default)]
     fields: Vec<Field>,
     command: String,
     #[serde(skip)]
     dir: PathBuf,
+    #[serde(skip)]
+    config: HashMap<String, String>,
 }
 
 impl Workflow {
@@ -278,6 +322,13 @@ fn validate_field_dependencies(workflow: &Workflow) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_workflow(workflow: &Workflow) -> Result<(), String> {
+    if workflow.config_namespace.as_deref() == Some("") {
+        return Err("config_namespace must not be empty".to_string());
+    }
+    validate_field_dependencies(workflow)
+}
+
 // A workflow's `dir` is where its .toml lives, exposed to the command and
 // choices_command as $HERDR_WORKFLOW_DIR so a workflow can reference its own
 // bundled helper scripts relocatably.
@@ -295,7 +346,7 @@ fn load_toml_file(path: &Path, dir: &Path, out: &mut Vec<Workflow>) {
                 );
                 return;
             }
-            if let Err(error) = validate_field_dependencies(&w) {
+            if let Err(error) = validate_workflow(&w) {
                 eprintln!("skip {}: {error}", path.display());
                 return;
             }
@@ -328,10 +379,29 @@ fn load_dir(dir: &Path, out: &mut Vec<Workflow>) {
     }
 }
 
-fn load_workflows() -> Vec<Workflow> {
+fn workflow_config_namespace(workflow: &Workflow) -> &str {
+    workflow
+        .config_namespace
+        .as_deref()
+        .unwrap_or(&workflow.name)
+}
+
+fn apply_workflow_config(workflow: &mut Workflow, config: &LauncherConfig) {
+    let namespace = workflow_config_namespace(workflow).to_string();
+    workflow.config = config
+        .workflows
+        .get(&namespace)
+        .cloned()
+        .unwrap_or_default();
+}
+
+fn load_workflows(config: &LauncherConfig) -> Vec<Workflow> {
     let mut out: Vec<Workflow> = Vec::new();
     for dir in workflow_dirs() {
         load_dir(&dir, &mut out);
+    }
+    for workflow in &mut out {
+        apply_workflow_config(workflow, config);
     }
     sort_workflows(&mut out);
     out
@@ -346,6 +416,12 @@ fn workflow_environment(
         "HERDR_WORKFLOW_DIR".to_string(),
         workflow.dir.to_string_lossy().into_owned(),
     );
+    for (key, value) in &workflow.config {
+        environment.insert(
+            format!("HERDR_WORKFLOW_CONFIG_{}", key.to_ascii_uppercase()),
+            value.clone(),
+        );
+    }
     for (key, value) in values {
         environment.insert(format!("HERDR_FIELD_{key}"), value.clone());
     }
@@ -366,7 +442,8 @@ fn choice_environment(
 }
 
 fn is_launcher_environment(key: &OsStr) -> bool {
-    key.to_string_lossy().starts_with("HERDR_FIELD_")
+    let key = key.to_string_lossy();
+    key.starts_with("HERDR_FIELD_") || key.starts_with("HERDR_WORKFLOW_CONFIG_")
 }
 
 fn shell_command(script: &str, environment: HashMap<String, String>) -> Command {
@@ -1321,11 +1398,11 @@ fn main() {
 
     match cmd {
         "list" => {
-            if let Err(error) = load_config() {
+            let config = load_config().unwrap_or_else(|error| {
                 eprintln!("{error}");
                 std::process::exit(1);
-            }
-            let workflows = load_workflows();
+            });
+            let workflows = load_workflows(&config);
             println!("Available workflows:");
             for w in &workflows {
                 println!("  {}\t{}", cli_workflow_label(w), w.description);
@@ -1354,11 +1431,11 @@ fn main() {
             }
         }
         "run" => {
-            if let Err(error) = load_config() {
+            let config = load_config().unwrap_or_else(|error| {
                 eprintln!("{error}");
                 std::process::exit(1);
-            }
-            let workflows = load_workflows();
+            });
+            let workflows = load_workflows(&config);
             let Some(name) = positionals.get(1) else {
                 eprintln!("usage: herdr-launcher run <name>");
                 std::process::exit(1);
@@ -1386,15 +1463,18 @@ fn main() {
                 run_startup_error_tui(error);
                 return;
             }
-            if let Err(error) = load_config() {
-                if !io::stdout().is_terminal() {
-                    eprintln!("{error}");
-                    std::process::exit(1);
+            let config = match load_config() {
+                Ok(config) => config,
+                Err(error) => {
+                    if !io::stdout().is_terminal() {
+                        eprintln!("{error}");
+                        std::process::exit(1);
+                    }
+                    run_startup_error_tui(error.to_string());
+                    return;
                 }
-                run_startup_error_tui(error.to_string());
-                return;
-            }
-            let workflows = load_workflows();
+            };
+            let workflows = load_workflows(&config);
             if workflows.is_empty() {
                 println!(
                     "No workflows found. Add .toml files to ~/.config/herdr-launcher/workflows/"
@@ -1410,7 +1490,7 @@ fn main() {
             }
         }
         "__snapshot" => {
-            let workflows = load_workflows();
+            let workflows = load_workflows(&LauncherConfig::default());
             let mut app = App::new(workflows);
             println!("--- list screen ---");
             print!("{}", dump_snapshot(&mut app, 72, 11));
@@ -1460,7 +1540,9 @@ mod tests {
             description: String::new(),
             fields,
             command: command.to_string(),
+            config_namespace: None,
             dir: PathBuf::new(),
+            config: HashMap::new(),
         }
     }
 
@@ -1742,7 +1824,9 @@ mod tests {
     fn choice_environment_contains_only_declared_dependencies() {
         let mut branch = field_with("branch", true, None, Some("printf main"));
         branch.depends_on = vec!["project".to_string()];
-        let wf = workflow("demo", "true", vec![field("project", true), branch.clone()]);
+        let mut wf = workflow("demo", "true", vec![field("project", true), branch.clone()]);
+        wf.config
+            .insert("root".to_string(), "/configured/root".to_string());
         let values = HashMap::from([
             ("project".to_string(), "alpha".to_string()),
             ("secret".to_string(), "not-for-choice-command".to_string()),
@@ -1754,12 +1838,148 @@ mod tests {
             Some("alpha")
         );
         assert!(!environment.contains_key("HERDR_FIELD_secret"));
+        assert_eq!(
+            environment
+                .get("HERDR_WORKFLOW_CONFIG_ROOT")
+                .map(String::as_str),
+            Some("/configured/root")
+        );
     }
 
     #[test]
     fn launcher_environment_filter_removes_inherited_field_values() {
         assert!(is_launcher_environment(OsStr::new("HERDR_FIELD_secret")));
+        assert!(is_launcher_environment(OsStr::new(
+            "HERDR_WORKFLOW_CONFIG_SECRET"
+        )));
         assert!(!is_launcher_environment(OsStr::new("PATH")));
+    }
+
+    #[test]
+    fn workflow_config_defaults_to_the_stable_name_namespace() {
+        let config = LauncherConfig {
+            workflows: HashMap::from([(
+                "launch-agent".to_string(),
+                HashMap::from([("profile".to_string(), "review".to_string())]),
+            )]),
+            ..LauncherConfig::default()
+        };
+        let mut workflow = workflow("launch-agent", "true", Vec::new());
+
+        apply_workflow_config(&mut workflow, &config);
+
+        assert_eq!(
+            workflow_environment(&workflow, &HashMap::new())
+                .get("HERDR_WORKFLOW_CONFIG_PROFILE")
+                .map(String::as_str),
+            Some("review")
+        );
+    }
+
+    #[test]
+    fn workflows_can_share_an_explicit_config_namespace() {
+        let config = LauncherConfig {
+            workflows: HashMap::from([(
+                "worktrees".to_string(),
+                HashMap::from([("project_root".to_string(), "/repos".to_string())]),
+            )]),
+            ..LauncherConfig::default()
+        };
+        let mut first = workflow("worktree-open", "true", Vec::new());
+        first.config_namespace = Some("worktrees".to_string());
+        let mut second = workflow("worktree-create", "true", Vec::new());
+        second.config_namespace = Some("worktrees".to_string());
+
+        apply_workflow_config(&mut first, &config);
+        apply_workflow_config(&mut second, &config);
+
+        assert_eq!(first.config, second.config);
+        assert_eq!(
+            first.config.get("project_root").map(String::as_str),
+            Some("/repos")
+        );
+    }
+
+    #[test]
+    fn missing_workflow_namespace_exports_no_configuration() {
+        let config = LauncherConfig::default();
+        let mut workflow = workflow("missing", "true", Vec::new());
+
+        apply_workflow_config(&mut workflow, &config);
+
+        assert!(workflow.config.is_empty());
+        assert!(!workflow_environment(&workflow, &HashMap::new())
+            .keys()
+            .any(|key| key.starts_with("HERDR_WORKFLOW_CONFIG_")));
+    }
+
+    #[test]
+    fn empty_explicit_config_namespace_is_rejected() {
+        let mut workflow = workflow("demo", "true", Vec::new());
+        workflow.config_namespace = Some(String::new());
+        assert!(validate_workflow(&workflow)
+            .unwrap_err()
+            .contains("config_namespace"));
+    }
+
+    #[test]
+    fn invalid_workflow_configuration_is_a_main_config_error() {
+        let root = env::temp_dir().join(format!("hl-config-validation-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let invalid_key = root.join("invalid-key.toml");
+        fs::write(&invalid_key, "[workflows.demo]\nMixedCase = \"value\"\n").unwrap();
+        assert!(load_config_from(Some(&invalid_key))
+            .unwrap_err()
+            .to_string()
+            .contains("lowercase"));
+
+        let collision = root.join("collision.toml");
+        fs::write(
+            &collision,
+            "[workflows.demo]\nname = \"one\"\nNAME = \"two\"\n",
+        )
+        .unwrap();
+        assert!(load_config_from(Some(&collision))
+            .unwrap_err()
+            .to_string()
+            .contains("collide"));
+
+        let non_string = root.join("non-string.toml");
+        fs::write(&non_string, "[workflows.demo]\ncount = 2\n").unwrap();
+        assert!(load_config_from(Some(&non_string)).is_err());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workflow_configuration_reaches_commands_and_choice_commands() {
+        let mut workflow = workflow(
+            "demo",
+            "printf '%s' \"$HERDR_WORKFLOW_CONFIG_PROFILE\"",
+            vec![field_with(
+                "choice",
+                true,
+                None,
+                Some("printf '%s\n' \"$HERDR_WORKFLOW_CONFIG_PROFILE\""),
+            )],
+        );
+        workflow
+            .config
+            .insert("profile".to_string(), "review".to_string());
+
+        let command_output = shell_command(
+            &workflow.command,
+            workflow_environment(&workflow, &HashMap::new()),
+        )
+        .output()
+        .unwrap();
+        assert_eq!(String::from_utf8(command_output.stdout).unwrap(), "review");
+        assert_eq!(
+            run_choices(&workflow.fields[0], &workflow, &HashMap::new()).unwrap(),
+            ["review"]
+        );
     }
 
     #[test]
