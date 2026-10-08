@@ -101,7 +101,7 @@ fn load_config_from(path: Option<&Path>) -> Result<LauncherConfig, LauncherConfi
     };
     let config = toml::from_str(&text).map_err(|error| LauncherConfigError {
         path: path.to_path_buf(),
-        detail: format!("{error}; placement must be 'split' or 'overlay'"),
+        detail: error.to_string(),
     })?;
     validate_workflow_config(&config).map_err(|detail| LauncherConfigError {
         path: path.to_path_buf(),
@@ -2604,6 +2604,21 @@ mod tests {
             Placement::Overlay
         );
 
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn unrelated_config_errors_do_not_include_placement_guidance() {
+        let path =
+            env::temp_dir().join(format!("hl-invalid-workflow-config-{}", std::process::id()));
+        fs::write(&path, "[workflows.demo]\nproject_root = 42\n").unwrap();
+
+        let error = load_config_from(Some(path.as_path()))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("project_root"), "{error}");
+        assert!(!error.contains("placement"), "{error}");
         let _ = fs::remove_file(path);
     }
 
