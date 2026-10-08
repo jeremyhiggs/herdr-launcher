@@ -13,7 +13,7 @@ use std::fmt;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher};
@@ -111,14 +111,7 @@ fn load_config_from(path: Option<&Path>) -> Result<LauncherConfig, LauncherConfi
 }
 
 fn valid_config_key(key: &str) -> bool {
-    let mut chars = key.chars();
-    match chars.next() {
-        Some(character) if character == '_' || character.is_ascii_lowercase() => {}
-        _ => return false,
-    }
-    chars.all(|character| {
-        character == '_' || character.is_ascii_lowercase() || character.is_ascii_digit()
-    })
+    valid_field_name(key) && !key.bytes().any(|byte| byte.is_ascii_uppercase())
 }
 
 fn validate_workflow_config(config: &LauncherConfig) -> Result<(), String> {
@@ -355,6 +348,16 @@ fn validate_field_dependencies(workflow: &Workflow) -> Result<(), String> {
 }
 
 fn validate_workflow(workflow: &Workflow) -> Result<(), String> {
+    if let Some(field) = workflow
+        .fields
+        .iter()
+        .find(|field| !valid_field_name(&field.name))
+    {
+        return Err(format!(
+            "field name '{}' is not a valid shell identifier ([A-Za-z_][A-Za-z0-9_]*)",
+            field.name
+        ));
+    }
     if workflow.config_namespace.as_deref() == Some("") {
         return Err("config_namespace must not be empty".to_string());
     }
@@ -370,14 +373,6 @@ fn load_toml_file(path: &Path, dir: &Path, out: &mut Vec<Workflow>) {
     };
     match toml::from_str::<Workflow>(&text) {
         Ok(mut w) if !out.iter().any(|x| x.name == w.name) => {
-            if let Some(bad) = w.fields.iter().find(|f| !valid_field_name(&f.name)) {
-                eprintln!(
-                    "skip {}: field name '{}' is not a valid shell identifier ([A-Za-z_][A-Za-z0-9_]*)",
-                    path.display(),
-                    bad.name
-                );
-                return;
-            }
             if let Err(error) = validate_workflow(&w) {
                 eprintln!("skip {}: {error}", path.display());
                 return;
@@ -455,8 +450,16 @@ fn evaluate_workflow_availability(workflow: &mut Workflow) {
         workflow.availability = WorkflowAvailability::Available;
         return;
     };
-    let output = shell_command(&command, workflow_environment(workflow, &HashMap::new())).output();
+    let output = shell_command(&command, workflow_environment(workflow, &HashMap::new()))
+        .stdout(Stdio::null())
+        .output();
     workflow.availability = availability_from_output(output);
+}
+
+fn evaluate_workflow_availabilities(workflows: &mut [Workflow]) {
+    for workflow in workflows {
+        evaluate_workflow_availability(workflow);
+    }
 }
 
 fn load_workflows(config: &LauncherConfig) -> Vec<Workflow> {
@@ -466,7 +469,6 @@ fn load_workflows(config: &LauncherConfig) -> Vec<Workflow> {
     }
     for workflow in &mut out {
         apply_workflow_config(workflow, config);
-        evaluate_workflow_availability(workflow);
     }
     sort_workflows(&mut out);
     out
@@ -772,19 +774,10 @@ impl App {
     }
 
     fn with_startup_error(error: String) -> Self {
-        App {
-            workflows: Vec::new(),
-            startup_error: Some(error),
-            selected: 0,
-            screen: Screen::StartupError,
-            form_idx: 0,
-            inputs: Vec::new(),
-            field_idx: 0,
-            has_form: false,
-            error: None,
-            loading_choices: false,
-            submit: None,
-        }
+        let mut app = Self::new(Vec::new());
+        app.startup_error = Some(error);
+        app.screen = Screen::StartupError;
+        app
     }
 
     fn move_list(&mut self, delta: isize) {
@@ -899,11 +892,14 @@ impl App {
     }
 
     fn refresh_choice(&mut self, index: usize) -> Result<(), String> {
-        let workflow = self.workflows[self.form_idx].clone();
-        let field = workflow.fields[index].clone();
-        if field.choices_command.is_none() {
+        if self.workflows[self.form_idx].fields[index]
+            .choices_command
+            .is_none()
+        {
             return Ok(());
         }
+        let workflow = self.workflows[self.form_idx].clone();
+        let field = workflow.fields[index].clone();
         let values = self.form_values();
         let signature = dependency_signature(&field, &values);
         let needs_refresh = match self.inputs.get(index) {
@@ -1481,7 +1477,8 @@ fn main() {
                 eprintln!("{error}");
                 std::process::exit(1);
             });
-            let workflows = load_workflows(&config);
+            let mut workflows = load_workflows(&config);
+            evaluate_workflow_availabilities(&mut workflows);
             println!("Available workflows:");
             for w in &workflows {
                 match &w.availability {
@@ -1526,14 +1523,15 @@ fn main() {
                 eprintln!("usage: herdr-launcher run <name>");
                 std::process::exit(1);
             };
-            match workflow_by_name(&workflows, name) {
-                Some(w) => {
-                    if let Err(error) = ensure_workflow_available(w) {
+            match workflow_by_name(&workflows, name).cloned() {
+                Some(mut workflow) => {
+                    evaluate_workflow_availability(&mut workflow);
+                    if let Err(error) = ensure_workflow_available(&workflow) {
                         eprintln!("{error}");
                         std::process::exit(1);
                     }
-                    match collect(w, &flags) {
-                        Ok(v) => run_workflow(w, &v),
+                    match collect(&workflow, &flags) {
+                        Ok(v) => run_workflow(&workflow, &v),
                         Err(e) => {
                             eprintln!("{e}");
                             std::process::exit(1);
@@ -1566,23 +1564,25 @@ fn main() {
                     return;
                 }
             };
-            let workflows = load_workflows(&config);
+            if !io::stdout().is_terminal() {
+                eprintln!("pick needs a terminal; use `run <name>` without a tty");
+                std::process::exit(1);
+            }
+            let mut workflows = load_workflows(&config);
             if workflows.is_empty() {
                 println!(
                     "No workflows found. Add .toml files to ~/.config/herdr-launcher/workflows/"
                 );
                 return;
             }
-            if !io::stdout().is_terminal() {
-                eprintln!("pick needs a terminal; use `run <name>` without a tty");
-                std::process::exit(1);
-            }
+            evaluate_workflow_availabilities(&mut workflows);
             if let Some((wf, values)) = run_tui(workflows) {
                 run_workflow(&wf, &values);
             }
         }
         "__snapshot" => {
-            let workflows = load_workflows(&LauncherConfig::default());
+            let mut workflows = load_workflows(&LauncherConfig::default());
+            evaluate_workflow_availabilities(&mut workflows);
             let mut app = App::new(workflows);
             println!("--- list screen ---");
             print!("{}", dump_snapshot(&mut app, 72, 11));
