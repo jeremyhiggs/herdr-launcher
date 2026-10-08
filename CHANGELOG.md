@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `overlay` pane placement and an in-pane diagnostic for invalid configuration.
 - Optional workflow titles for friendly picker labels while preserving stable names
   for CLI lookup and future configuration.
+- Dependency-aware choice fields with generic loading feedback, refresh and
+  submission revalidation, exact output values, and visible retryable failures.
 
 ## [0.3.0] - 2026-07-10
 

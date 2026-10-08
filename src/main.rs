@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
@@ -162,6 +163,8 @@ struct Field {
     multiline: bool,
     #[serde(default)]
     choices_command: Option<String>,
+    #[serde(default)]
+    depends_on: Vec<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -252,6 +255,29 @@ fn valid_field_name(name: &str) -> bool {
     chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
+fn validate_field_dependencies(workflow: &Workflow) -> Result<(), String> {
+    for (index, field) in workflow.fields.iter().enumerate() {
+        if !field.depends_on.is_empty() && field.choices_command.is_none() {
+            return Err(format!(
+                "field '{}' declares depends_on but has no choices_command",
+                field.name
+            ));
+        }
+        for dependency in &field.depends_on {
+            if !workflow.fields[..index]
+                .iter()
+                .any(|candidate| candidate.name == *dependency)
+            {
+                return Err(format!(
+                    "field '{}' dependency '{}' must name an earlier field",
+                    field.name, dependency
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 // A workflow's `dir` is where its .toml lives, exposed to the command and
 // choices_command as $HERDR_WORKFLOW_DIR so a workflow can reference its own
 // bundled helper scripts relocatably.
@@ -267,6 +293,10 @@ fn load_toml_file(path: &Path, dir: &Path, out: &mut Vec<Workflow>) {
                     path.display(),
                     bad.name
                 );
+                return;
+            }
+            if let Err(error) = validate_field_dependencies(&w) {
+                eprintln!("skip {}: {error}", path.display());
                 return;
             }
             w.dir = dir.to_path_buf();
@@ -307,16 +337,52 @@ fn load_workflows() -> Vec<Workflow> {
     out
 }
 
+fn workflow_environment(
+    workflow: &Workflow,
+    values: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut environment = HashMap::new();
+    environment.insert(
+        "HERDR_WORKFLOW_DIR".to_string(),
+        workflow.dir.to_string_lossy().into_owned(),
+    );
+    for (key, value) in values {
+        environment.insert(format!("HERDR_FIELD_{key}"), value.clone());
+    }
+    environment
+}
+
+fn choice_environment(
+    workflow: &Workflow,
+    field: &Field,
+    values: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let dependencies = field
+        .depends_on
+        .iter()
+        .filter_map(|name| values.get(name).map(|value| (name.clone(), value.clone())))
+        .collect();
+    workflow_environment(workflow, &dependencies)
+}
+
+fn is_launcher_environment(key: &OsStr) -> bool {
+    key.to_string_lossy().starts_with("HERDR_FIELD_")
+}
+
+fn shell_command(script: &str, environment: HashMap<String, String>) -> Command {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(script);
+    command.env_clear();
+    command.envs(env::vars_os().filter(|(key, _)| !is_launcher_environment(key)));
+    command.envs(environment);
+    command
+}
+
 fn run_workflow(wf: &Workflow, values: &HashMap<String, String>) -> ! {
     // The command reads field values from $HERDR_FIELD_<name> (and $HERDR_WORKFLOW_DIR
     // for bundled scripts). Values are passed via the environment, never interpolated
     // into the command string, so a field containing shell metacharacters can't inject.
-    let mut command = Command::new("sh");
-    command.arg("-c").arg(&wf.command);
-    command.env("HERDR_WORKFLOW_DIR", &wf.dir);
-    for (k, v) in values {
-        command.env(format!("HERDR_FIELD_{k}"), v);
-    }
+    let mut command = shell_command(&wf.command, workflow_environment(wf, values));
     match command.status() {
         Ok(s) => std::process::exit(s.code().unwrap_or(0)),
         Err(e) => {
@@ -372,6 +438,8 @@ struct SelectField {
     sel: usize,
     value: String,
     matcher: Matcher,
+    dependency_signature: Option<Vec<(String, String)>>,
+    dirty: bool,
 }
 
 impl SelectField {
@@ -383,6 +451,8 @@ impl SelectField {
             sel: 0,
             value: String::new(),
             matcher: Matcher::new(Config::DEFAULT),
+            dependency_signature: None,
+            dirty: false,
         };
         select.refilter();
         if let Some(d) = default {
@@ -392,6 +462,31 @@ impl SelectField {
         }
         select.commit();
         select
+    }
+
+    fn pending() -> Self {
+        let mut select = Self::new(Vec::new(), None);
+        select.dirty = true;
+        select
+    }
+
+    fn replace_choices(&mut self, choices: Vec<String>, default: Option<&str>) {
+        let previous = self.value.clone();
+        self.choices = choices;
+        self.query = Input::default();
+        self.sel = 0;
+        self.refilter();
+        let preferred = self
+            .filtered
+            .iter()
+            .position(|choice| *choice == previous)
+            .or_else(|| {
+                default.and_then(|value| self.filtered.iter().position(|choice| choice == value))
+            });
+        if let Some(position) = preferred {
+            self.sel = position;
+        }
+        self.commit();
     }
 
     fn refilter(&mut self) {
@@ -435,32 +530,59 @@ impl SelectField {
     }
 }
 
-fn run_choices(command: &str, workflow_dir: &Path) -> Vec<String> {
-    let Ok(output) = Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .env("HERDR_WORKFLOW_DIR", workflow_dir)
-        .output()
-    else {
-        return vec![];
-    };
-    if !output.status.success() {
-        return vec![];
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(|line| line.trim().to_string())
-        .filter(|line| !line.is_empty())
+fn dependency_signature(field: &Field, values: &HashMap<String, String>) -> Vec<(String, String)> {
+    field
+        .depends_on
+        .iter()
+        .map(|name| (name.clone(), values.get(name).cloned().unwrap_or_default()))
         .collect()
 }
 
-fn build_input(field: &Field, workflow_dir: &Path) -> FieldInput {
+fn run_choices(
+    field: &Field,
+    workflow: &Workflow,
+    values: &HashMap<String, String>,
+) -> Result<Vec<String>, String> {
+    let Some(command) = field.choices_command.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let output = shell_command(command, choice_environment(workflow, field, values))
+        .output()
+        .map_err(|error| {
+            format!(
+                "failed to start choices command for '{}': {error}",
+                field.name
+            )
+        })?;
+    if !output.status.success() {
+        let detail = sanitize_env_value(String::from_utf8_lossy(&output.stderr).trim());
+        let status = output
+            .status
+            .code()
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "signal".to_string());
+        return Err(if detail.is_empty() {
+            format!("choices command for '{}' failed ({status})", field.name)
+        } else {
+            format!(
+                "choices command for '{}' failed ({status}): {detail}",
+                field.name
+            )
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .filter(|line| !line.is_empty())
+        .collect())
+}
+
+fn build_input(field: &Field) -> FieldInput {
     let default = field.default.clone().unwrap_or_default();
-    if let Some(command) = &field.choices_command {
+    if field.choices_command.is_some() {
         // Always a Select (even with no candidates) so a choices_command field stays
         // constrained — never silently downgraded to unvalidated free text.
-        let choices = run_choices(command, workflow_dir);
-        return FieldInput::Select(Box::new(SelectField::new(choices, field.default.clone())));
+        return FieldInput::Select(Box::new(SelectField::pending()));
     }
     if field.multiline {
         let mut area = if default.is_empty() {
@@ -486,6 +608,7 @@ struct App {
     field_idx: usize,
     has_form: bool, // whether `inputs` holds a form for `form_idx`
     error: Option<String>,
+    loading_choices: bool,
     submit: Option<(Workflow, HashMap<String, String>)>,
 }
 
@@ -501,6 +624,7 @@ impl App {
             field_idx: 0,
             has_form: false,
             error: None,
+            loading_choices: false,
             submit: None,
         }
     }
@@ -516,6 +640,7 @@ impl App {
             field_idx: 0,
             has_form: false,
             error: None,
+            loading_choices: false,
             submit: None,
         }
     }
@@ -528,23 +653,49 @@ impl App {
         self.selected = (((self.selected as isize) + delta).rem_euclid(n)) as usize;
     }
 
-    fn open_form(&mut self) {
+    fn prepare_form(&mut self) -> bool {
+        if self.workflows.is_empty() {
+            return false;
+        }
         // Rebuild only when entering a different workflow. Re-opening the same one
         // (e.g. after Esc to peek at the list) keeps whatever was already typed.
         if !self.has_form || self.form_idx != self.selected {
             self.form_idx = self.selected;
             let wf = &self.workflows[self.form_idx];
-            let dir = wf.dir.clone();
-            self.inputs = wf
-                .fields
-                .iter()
-                .map(|field| build_input(field, &dir))
-                .collect();
+            self.inputs = wf.fields.iter().map(build_input).collect();
             self.field_idx = 0;
             self.has_form = true;
+        } else {
+            for input in &mut self.inputs {
+                if let FieldInput::Select(select) = input {
+                    select.dirty = true;
+                }
+            }
         }
         self.error = None;
         self.screen = Screen::Form;
+        self.loading_choices = self.workflows[self.form_idx]
+            .fields
+            .iter()
+            .any(|field| field.choices_command.is_some());
+        true
+    }
+
+    fn refresh_form_choices(&mut self) {
+        for index in 0..self.inputs.len() {
+            if let Err(error) = self.refresh_choice(index) {
+                self.field_idx = index;
+                self.error = Some(error);
+                break;
+            }
+        }
+        self.loading_choices = false;
+    }
+
+    fn open_form(&mut self) {
+        if self.prepare_form() {
+            self.refresh_form_choices();
+        }
     }
 
     fn move_field(&mut self, delta: isize) {
@@ -553,17 +704,137 @@ impl App {
             return;
         }
         self.field_idx = (((self.field_idx as isize) + delta).rem_euclid(n)) as usize;
+        if let Err(error) = self.refresh_choice(self.field_idx) {
+            self.error = Some(error);
+        }
     }
 
     fn current_multiline(&self) -> bool {
         matches!(self.inputs.get(self.field_idx), Some(FieldInput::Area(_)))
     }
 
+    fn form_values(&self) -> HashMap<String, String> {
+        self.workflows[self.form_idx]
+            .fields
+            .iter()
+            .zip(&self.inputs)
+            .map(|(field, input)| (field.name.clone(), input.value()))
+            .collect()
+    }
+
+    fn mark_dependents_dirty(&mut self, changed_index: usize) {
+        let changed_name = self.workflows[self.form_idx].fields[changed_index]
+            .name
+            .clone();
+        for (index, field) in self.workflows[self.form_idx]
+            .fields
+            .iter()
+            .enumerate()
+            .skip(changed_index + 1)
+        {
+            if field.depends_on.contains(&changed_name) {
+                if let Some(FieldInput::Select(select)) = self.inputs.get_mut(index) {
+                    select.dirty = true;
+                }
+            }
+        }
+    }
+
+    fn handle_current_input(&mut self, key: KeyEvent) {
+        let Some(input) = self.inputs.get_mut(self.field_idx) else {
+            return;
+        };
+        let before = input.value();
+        input.handle(key);
+        if input.value() != before {
+            self.mark_dependents_dirty(self.field_idx);
+        }
+    }
+
+    fn refresh_choice(&mut self, index: usize) -> Result<(), String> {
+        let workflow = self.workflows[self.form_idx].clone();
+        let field = workflow.fields[index].clone();
+        if field.choices_command.is_none() {
+            return Ok(());
+        }
+        let values = self.form_values();
+        let signature = dependency_signature(&field, &values);
+        let needs_refresh = match self.inputs.get(index) {
+            Some(FieldInput::Select(select)) => {
+                select.dirty || select.dependency_signature.as_ref() != Some(&signature)
+            }
+            _ => false,
+        };
+        if !needs_refresh {
+            return Ok(());
+        }
+
+        let before = self.inputs[index].value();
+        let has_unresolved_required_dependency = field.depends_on.iter().any(|name| {
+            workflow
+                .fields
+                .iter()
+                .find(|candidate| candidate.name == *name)
+                .is_some_and(|dependency| {
+                    dependency.required
+                        && values.get(name).is_none_or(|value| value.trim().is_empty())
+                })
+        });
+        if has_unresolved_required_dependency {
+            let select = match &mut self.inputs[index] {
+                FieldInput::Select(select) => select,
+                _ => return Ok(()),
+            };
+            select.dependency_signature = Some(signature);
+            select.replace_choices(Vec::new(), None);
+            select.dirty = false;
+            if before != select.value {
+                self.mark_dependents_dirty(index);
+            }
+            return Ok(());
+        }
+
+        let result = run_choices(&field, &workflow, &values);
+        let select = match &mut self.inputs[index] {
+            FieldInput::Select(select) => select,
+            _ => return Ok(()),
+        };
+        select.dependency_signature = Some(signature);
+        match result {
+            Ok(choices) => {
+                select.replace_choices(choices, field.default.as_deref());
+                select.dirty = false;
+            }
+            Err(error) => {
+                select.replace_choices(Vec::new(), None);
+                select.dirty = true;
+                if before != select.value {
+                    self.mark_dependents_dirty(index);
+                }
+                return Err(error);
+            }
+        }
+        if before != select.value {
+            self.mark_dependents_dirty(index);
+        }
+        Ok(())
+    }
+
     fn try_submit(&mut self) {
+        self.submit = None;
+        for index in 0..self.inputs.len() {
+            if let Err(error) = self.refresh_choice(index) {
+                self.field_idx = index;
+                self.error = Some(error);
+                return;
+            }
+        }
         let wf = self.workflows[self.form_idx].clone();
         let mut values: Vec<String> = self.inputs.iter().map(FieldInput::value).collect();
         for (i, f) in wf.fields.iter().enumerate() {
-            if values[i].trim().is_empty() {
+            if values[i].trim().is_empty()
+                && !matches!(self.inputs.get(i), Some(FieldInput::Select(_)))
+            {
                 if let Some(d) = &f.default {
                     values[i] = d.clone();
                 }
@@ -671,6 +942,7 @@ fn ui(f: &mut Frame, app: &mut App) {
                 field_idx,
                 inputs,
                 error,
+                loading_choices,
                 ..
             } = app;
             let wf = &workflows[*form_idx];
@@ -807,7 +1079,9 @@ fn ui(f: &mut Frame, app: &mut App) {
             }
 
             let last = rows.len() - 1;
-            let footer = if let Some(err) = error.as_deref() {
+            let footer = if *loading_choices {
+                Line::from(" Loading choices…").style(Style::new().cyan().bold())
+            } else if let Some(err) = error.as_deref() {
                 Line::from(format!(" {err}")).style(Style::new().red().bold())
             } else {
                 let hint = if matches!(inputs.get(*field_idx), Some(FieldInput::Select(_))) {
@@ -847,7 +1121,11 @@ fn run_app_tui(mut app: App) -> Option<(Workflow, HashMap<String, String>)> {
                 KeyCode::Char('q') | KeyCode::Esc => break,
                 KeyCode::Down | KeyCode::Char('j') => app.move_list(1),
                 KeyCode::Up | KeyCode::Char('k') => app.move_list(-1),
-                KeyCode::Enter => app.open_form(),
+                KeyCode::Enter if app.prepare_form() => {
+                    let _ = terminal.draw(|f| ui(f, &mut app));
+                    app.refresh_form_choices();
+                }
+                KeyCode::Enter => {}
                 _ => {}
             },
             Screen::Form => {
@@ -868,7 +1146,7 @@ fn run_app_tui(mut app: App) -> Option<(Workflow, HashMap<String, String>)> {
                             app.move_field(1);
                         }
                     }
-                    _ if !app.inputs.is_empty() => app.inputs[app.field_idx].handle(key),
+                    _ if !app.inputs.is_empty() => app.handle_current_input(key),
                     _ => {}
                 }
             }
@@ -925,15 +1203,19 @@ fn collect_fields(
         // choices_command fields are a pick-from-a-known-list even on the non-TUI path:
         // surface the options when prompting and reject anything outside them.
         let choices = match &f.choices_command {
-            Some(command) => run_choices(command, &wf.dir),
-            None => Vec::new(),
+            Some(_) => Some(run_choices(f, wf, &values)?),
+            None => None,
         };
         let label = f.prompt.clone().unwrap_or_else(|| f.name.clone());
-        let hint = if choices.is_empty() {
+        let hint = if choices.as_ref().is_none_or(Vec::is_empty) {
             String::new()
         } else {
-            format!(" [{}]", choices.join(", "))
+            format!(" [{}]", choices.as_ref().unwrap().join(", "))
         };
+
+        if f.required && choices.as_ref().is_some_and(Vec::is_empty) {
+            return Err(format!("no choices available for --{}", f.name));
+        }
 
         let val = if let Some(v) = flags.get(&f.name) {
             v.clone()
@@ -960,12 +1242,18 @@ fn collect_fields(
             String::new()
         };
 
-        if !choices.is_empty() && !val.is_empty() && !choices.contains(&val) {
-            return Err(format!(
-                "invalid value for --{}: '{val}' (choices: {})",
-                f.name,
-                choices.join(", ")
-            ));
+        if let Some(choices) = choices {
+            if !val.is_empty() && !choices.contains(&val) {
+                let allowed = if choices.is_empty() {
+                    "no choices available".to_string()
+                } else {
+                    format!("choices: {}", choices.join(", "))
+                };
+                return Err(format!(
+                    "invalid value for --{}: '{val}' ({allowed})",
+                    f.name
+                ));
+            }
         }
         values.insert(f.name.clone(), val);
     }
@@ -1161,6 +1449,7 @@ mod tests {
             default: default.map(String::from),
             multiline: false,
             choices_command: choices_command.map(String::from),
+            depends_on: Vec::new(),
         }
     }
 
@@ -1419,6 +1708,318 @@ mod tests {
             "",
             "switching workflows rebuilds the form"
         );
+    }
+
+    #[test]
+    fn choice_dependencies_must_reference_earlier_fields() {
+        let mut later = field_with("branch", true, None, Some("printf main"));
+        later.depends_on = vec!["project".to_string()];
+        let invalid_order = workflow(
+            "invalid",
+            "true",
+            vec![later.clone(), field("project", true)],
+        );
+        assert!(validate_field_dependencies(&invalid_order)
+            .unwrap_err()
+            .contains("earlier field"));
+
+        let mut no_command = field("branch", true);
+        no_command.depends_on = vec!["project".to_string()];
+        let invalid_kind = workflow(
+            "invalid-kind",
+            "true",
+            vec![field("project", true), no_command],
+        );
+        assert!(validate_field_dependencies(&invalid_kind)
+            .unwrap_err()
+            .contains("no choices_command"));
+
+        let valid = workflow("valid", "true", vec![field("project", true), later]);
+        assert!(validate_field_dependencies(&valid).is_ok());
+    }
+
+    #[test]
+    fn choice_environment_contains_only_declared_dependencies() {
+        let mut branch = field_with("branch", true, None, Some("printf main"));
+        branch.depends_on = vec!["project".to_string()];
+        let wf = workflow("demo", "true", vec![field("project", true), branch.clone()]);
+        let values = HashMap::from([
+            ("project".to_string(), "alpha".to_string()),
+            ("secret".to_string(), "not-for-choice-command".to_string()),
+        ]);
+
+        let environment = choice_environment(&wf, &branch, &values);
+        assert_eq!(
+            environment.get("HERDR_FIELD_project").map(String::as_str),
+            Some("alpha")
+        );
+        assert!(!environment.contains_key("HERDR_FIELD_secret"));
+    }
+
+    #[test]
+    fn launcher_environment_filter_removes_inherited_field_values() {
+        assert!(is_launcher_environment(OsStr::new("HERDR_FIELD_secret")));
+        assert!(!is_launcher_environment(OsStr::new("PATH")));
+    }
+
+    #[test]
+    fn choice_values_preserve_leading_and_trailing_spaces() {
+        let field = field_with("project", true, None, Some("printf ' repo \nrepo\n'"));
+        let wf = workflow("demo", "true", vec![field.clone()]);
+
+        assert_eq!(
+            run_choices(&field, &wf, &HashMap::new()).unwrap(),
+            vec![" repo ".to_string(), "repo".to_string()]
+        );
+    }
+
+    #[test]
+    fn form_renders_generic_loading_feedback_before_choices_run() {
+        let marker = env::temp_dir().join(format!("hl-loading-choices-{}", std::process::id()));
+        let _ = fs::remove_file(&marker);
+        let command = format!("printf ran > '{}'; printf 'choice\n'", marker.display());
+        let wf = workflow(
+            "demo",
+            "true",
+            vec![field_with("project", true, None, Some(&command))],
+        );
+        let mut app = App::new(vec![wf]);
+
+        assert!(app.prepare_form());
+        let out = dump_snapshot(&mut app, 72, 14);
+        assert!(out.contains("Loading choices"), "{out}");
+        assert!(
+            !marker.exists(),
+            "choices must wait until feedback is drawn"
+        );
+
+        app.refresh_form_choices();
+        assert!(marker.exists());
+        assert_eq!(app.inputs[0].value(), "choice");
+        let _ = fs::remove_file(marker);
+    }
+
+    #[test]
+    fn dependent_choice_refreshes_before_submit_and_drops_stale_value() {
+        let mut branch = field_with(
+            "branch",
+            true,
+            None,
+            Some("printf '%s-branch\n' \"$HERDR_FIELD_project\""),
+        );
+        branch.depends_on = vec!["project".to_string()];
+        let wf = workflow(
+            "demo",
+            "true",
+            vec![
+                field_with("project", true, None, Some("printf 'alpha\nbeta\n'")),
+                branch,
+            ],
+        );
+        let mut app = App::new(vec![wf]);
+        app.open_form();
+        assert_eq!(app.inputs[1].value(), "alpha-branch");
+
+        app.field_idx = 0;
+        app.handle_current_input(KeyEvent::from(KeyCode::Down));
+        assert_eq!(app.inputs[0].value(), "beta");
+        assert_eq!(app.inputs[1].value(), "alpha-branch");
+
+        app.try_submit();
+        let (_, values) = app.submit.expect("submit should refresh dependent choices");
+        assert_eq!(values.get("branch"), Some(&"beta-branch".to_string()));
+    }
+
+    #[test]
+    fn unresolved_required_dependency_does_not_run_downstream_choices() {
+        let marker =
+            env::temp_dir().join(format!("hl-unresolved-dependency-{}", std::process::id()));
+        let _ = fs::remove_file(&marker);
+        let mut branch = field_with(
+            "branch",
+            true,
+            None,
+            Some(&format!("printf ran > '{}'; exit 9", marker.display())),
+        );
+        branch.depends_on = vec!["project".to_string()];
+        let wf = workflow(
+            "demo",
+            "true",
+            vec![field_with("project", true, None, Some("true")), branch],
+        );
+        let mut app = App::new(vec![wf]);
+
+        app.open_form();
+        assert!(app.error.is_none());
+        assert!(!marker.exists());
+
+        app.try_submit();
+        assert!(app.submit.is_none());
+        assert!(app
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("project") && error.contains("required")));
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn failed_choice_evaluation_is_visible_and_retryable() {
+        let marker = env::temp_dir().join(format!("hl-choice-retry-{}", std::process::id()));
+        let _ = fs::remove_file(&marker);
+        let command = format!(
+            "test -f '{}' && printf 'ready\n' || {{ printf 'not ready' >&2; exit 1; }}",
+            marker.display()
+        );
+        let wf = workflow(
+            "demo",
+            "true",
+            vec![field_with("choice", true, None, Some(&command))],
+        );
+        let mut app = App::new(vec![wf]);
+        app.open_form();
+        assert!(app
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("not ready")));
+
+        fs::write(&marker, "ready").unwrap();
+        app.try_submit();
+        assert!(app.submit.is_some());
+        assert_eq!(app.inputs[0].value(), "ready");
+        let _ = fs::remove_file(marker);
+    }
+
+    #[test]
+    fn unchanged_dependency_signature_does_not_rerun_choices() {
+        let counter = env::temp_dir().join(format!("hl-choice-count-{}", std::process::id()));
+        let _ = fs::remove_file(&counter);
+        let command = format!(
+            "n=$(cat '{}' 2>/dev/null || printf 0); n=$((n + 1)); printf '%s' \"$n\" > '{}'; printf 'only\n'",
+            counter.display(),
+            counter.display()
+        );
+        let wf = workflow(
+            "demo",
+            "true",
+            vec![field_with("choice", true, None, Some(&command))],
+        );
+        let mut app = App::new(vec![wf]);
+        app.open_form();
+        app.refresh_choice(0).unwrap();
+
+        assert_eq!(fs::read_to_string(&counter).unwrap(), "1");
+        let _ = fs::remove_file(counter);
+    }
+
+    #[test]
+    fn reopening_form_refreshes_choices_without_dropping_typed_input() {
+        let choices = env::temp_dir().join(format!("hl-reopen-choices-{}", std::process::id()));
+        let _ = fs::remove_file(&choices);
+        fs::write(&choices, "alpha\n").unwrap();
+        let command = format!("cat '{}'", choices.display());
+        let wf = workflow(
+            "demo",
+            "true",
+            vec![
+                field("note", false),
+                field_with("project", true, None, Some(&command)),
+            ],
+        );
+        let mut app = App::new(vec![wf]);
+        app.open_form();
+        app.inputs[0] = FieldInput::Line(Input::new("typed".to_string()));
+        assert_eq!(app.inputs[1].value(), "alpha");
+
+        fs::write(&choices, "beta\n").unwrap();
+        app.screen = Screen::List;
+        app.open_form();
+
+        assert_eq!(app.inputs[0].value(), "typed");
+        assert_eq!(app.inputs[1].value(), "beta");
+        let _ = fs::remove_file(choices);
+    }
+
+    #[test]
+    fn empty_and_failed_choice_sets_remain_constrained_in_cli() {
+        let empty = workflow(
+            "empty",
+            "true",
+            vec![field_with("choice", true, None, Some("true"))],
+        );
+        let supplied = HashMap::from([("choice".to_string(), "anything".to_string())]);
+        let empty_error = collect_fields(&empty, &supplied, false, |_| None).unwrap_err();
+        assert!(
+            empty_error.contains("no choices available"),
+            "{empty_error}"
+        );
+
+        let failed = workflow(
+            "failed",
+            "true",
+            vec![field_with(
+                "choice",
+                true,
+                None,
+                Some("printf 'choice command broke' >&2; exit 9"),
+            )],
+        );
+        let failed_error = collect_fields(&failed, &supplied, false, |_| None).unwrap_err();
+        assert!(
+            failed_error.contains("choice command broke"),
+            "{failed_error}"
+        );
+    }
+
+    #[test]
+    fn empty_choice_set_cannot_restore_a_tui_default() {
+        let wf = workflow(
+            "empty",
+            "true",
+            vec![field_with("choice", true, Some("fallback"), Some("true"))],
+        );
+        let mut app = App::new(vec![wf]);
+
+        app.open_form();
+        app.try_submit();
+
+        assert!(app.submit.is_none());
+        assert_eq!(app.inputs[0].value(), "");
+        assert!(app
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("required")));
+    }
+
+    #[test]
+    fn cli_dependent_choices_use_the_selected_upstream_value() {
+        let mut branch = field_with(
+            "branch",
+            true,
+            None,
+            Some("printf '%s-branch\n' \"$HERDR_FIELD_project\""),
+        );
+        branch.depends_on = vec!["project".to_string()];
+        let wf = workflow(
+            "demo",
+            "true",
+            vec![
+                field_with("project", true, None, Some("printf 'alpha\nbeta\n'")),
+                branch,
+            ],
+        );
+        let valid = HashMap::from([
+            ("project".to_string(), "beta".to_string()),
+            ("branch".to_string(), "beta-branch".to_string()),
+        ]);
+        let invalid = HashMap::from([
+            ("project".to_string(), "beta".to_string()),
+            ("branch".to_string(), "alpha-branch".to_string()),
+        ]);
+
+        assert!(collect_fields(&wf, &valid, false, |_| None).is_ok());
+        assert!(collect_fields(&wf, &invalid, false, |_| None)
+            .unwrap_err()
+            .contains("invalid value"));
     }
 
     #[test]

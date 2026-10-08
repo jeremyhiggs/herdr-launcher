@@ -94,8 +94,20 @@ Field keys:
 | `default` | initial value / preselected choice |
 | `multiline` | render a multi-line text area |
 | `choices_command` | shell command whose stdout lines become a fuzzy-select list |
+| `depends_on` | earlier field names whose resolved values affect this choice list |
 
 `fields` is optional — a workflow with none just runs its `command`.
+
+A `choices_command` with `depends_on = ["project"]` receives only that
+dependency as `$HERDR_FIELD_project`, plus the normal workflow context.
+Dependencies must name earlier fields. Launcher refreshes a dependent list when
+its inputs change, including immediately before submission.
+
+Choice commands run synchronously, so Launcher displays `Loading choices…`
+before evaluating them. Successful empty output remains an empty, constrained
+select. A nonzero exit is shown as an error and retried when the field is entered
+again or the form is submitted. Neither case falls back to free text in the TUI
+or CLI. Output values preserve leading and trailing spaces.
 
 ### Bundles + `$HERDR_WORKFLOW_DIR`
 
