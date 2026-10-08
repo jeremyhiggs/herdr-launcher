@@ -75,6 +75,8 @@ name = "greet"
 title = "Say Hello" # optional display label; `name` remains the CLI identifier
 # config_namespace = "greetings" # optional shared [workflows.greetings] config
 description = "Prints a greeting"
+# Optional: exit zero when runnable; explain failures on stderr.
+availability_command = "test -n \"$HERDR_WORKFLOW_CONFIG_PROFILE\" || { echo 'Set a profile in Launcher config' >&2; exit 1; }"
 # Field values are passed via $HERDR_FIELD_<name> (never interpolated into the
 # shell — no injection). $HERDR_WORKFLOW_DIR points at this workflow's folder.
 command = "echo \"Hi $HERDR_FIELD_name — lang=$HERDR_FIELD_lang\""
@@ -118,6 +120,12 @@ before evaluating them. Successful empty output remains an empty, constrained
 select. A nonzero exit is shown as an error and retried when the field is entered
 again or the form is submitted. Neither case falls back to free text in the TUI
 or CLI. Output values preserve leading and trailing spaces.
+
+An optional `availability_command` runs when workflows load. It receives
+`$HERDR_WORKFLOW_DIR` and the resolved `$HERDR_WORKFLOW_CONFIG_*` values, but no
+field values. Exit zero enables the workflow. A nonzero exit keeps it visible as
+disabled, displays its sanitized stderr as the reason, and prevents both TUI and
+CLI execution. Keep the check fast because workflow loading is synchronous.
 
 ### Bundles + `$HERDR_WORKFLOW_DIR`
 

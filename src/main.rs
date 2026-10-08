@@ -13,7 +13,7 @@ use std::fmt;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher};
@@ -207,11 +207,20 @@ struct Field {
     depends_on: Vec<String>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum WorkflowAvailability {
+    #[default]
+    Available,
+    Disabled(String),
+}
+
 #[derive(Deserialize, Clone)]
 struct Workflow {
     name: String,
     #[serde(default)]
     title: Option<String>,
+    #[serde(default)]
+    availability_command: Option<String>,
     #[serde(default)]
     config_namespace: Option<String>,
     #[serde(default)]
@@ -223,6 +232,8 @@ struct Workflow {
     dir: PathBuf,
     #[serde(skip)]
     config: HashMap<String, String>,
+    #[serde(skip)]
+    availability: WorkflowAvailability,
 }
 
 impl Workflow {
@@ -239,6 +250,27 @@ fn cli_workflow_label(workflow: &Workflow) -> String {
         workflow.name.clone()
     } else {
         format!("{} [{}]", workflow.label(), workflow.name)
+    }
+}
+
+fn workflow_list_text(workflow: &Workflow) -> String {
+    match &workflow.availability {
+        WorkflowAvailability::Available => {
+            format!("{}  —  {}", workflow.label(), workflow.description)
+        }
+        WorkflowAvailability::Disabled(reason) => {
+            format!("[disabled] {}  —  {reason}", workflow.label())
+        }
+    }
+}
+
+fn ensure_workflow_available(workflow: &Workflow) -> Result<(), String> {
+    match &workflow.availability {
+        WorkflowAvailability::Available => Ok(()),
+        WorkflowAvailability::Disabled(reason) => Err(format!(
+            "workflow '{}' is disabled: {reason}",
+            workflow.name
+        )),
     }
 }
 
@@ -395,6 +427,38 @@ fn apply_workflow_config(workflow: &mut Workflow, config: &LauncherConfig) {
         .unwrap_or_default();
 }
 
+fn availability_from_output(output: io::Result<Output>) -> WorkflowAvailability {
+    match output {
+        Ok(output) if output.status.success() => WorkflowAvailability::Available,
+        Ok(output) => {
+            let reason = sanitize_env_value(String::from_utf8_lossy(&output.stderr).trim());
+            if reason.is_empty() {
+                let status = output
+                    .status
+                    .code()
+                    .map(|code| format!("exit {code}"))
+                    .unwrap_or_else(|| "signal".to_string());
+                WorkflowAvailability::Disabled(format!("availability check failed ({status})"))
+            } else {
+                WorkflowAvailability::Disabled(reason)
+            }
+        }
+        Err(error) => WorkflowAvailability::Disabled(format!(
+            "availability check could not start: {}",
+            sanitize_env_value(&error.to_string())
+        )),
+    }
+}
+
+fn evaluate_workflow_availability(workflow: &mut Workflow) {
+    let Some(command) = workflow.availability_command.clone() else {
+        workflow.availability = WorkflowAvailability::Available;
+        return;
+    };
+    let output = shell_command(&command, workflow_environment(workflow, &HashMap::new())).output();
+    workflow.availability = availability_from_output(output);
+}
+
 fn load_workflows(config: &LauncherConfig) -> Vec<Workflow> {
     let mut out: Vec<Workflow> = Vec::new();
     for dir in workflow_dirs() {
@@ -402,6 +466,7 @@ fn load_workflows(config: &LauncherConfig) -> Vec<Workflow> {
     }
     for workflow in &mut out {
         apply_workflow_config(workflow, config);
+        evaluate_workflow_availability(workflow);
     }
     sort_workflows(&mut out);
     out
@@ -728,10 +793,15 @@ impl App {
             return;
         }
         self.selected = (((self.selected as isize) + delta).rem_euclid(n)) as usize;
+        self.error = None;
     }
 
     fn prepare_form(&mut self) -> bool {
         if self.workflows.is_empty() {
+            return false;
+        }
+        if let Err(error) = ensure_workflow_available(&self.workflows[self.selected]) {
+            self.error = Some(error);
             return false;
         }
         // Rebuild only when entering a different workflow. Re-opening the same one
@@ -999,7 +1069,14 @@ fn ui(f: &mut Frame, app: &mut App) {
             let items: Vec<ListItem> = app
                 .workflows
                 .iter()
-                .map(|w| ListItem::new(format!(" {}  —  {}", w.label(), w.description)))
+                .map(|workflow| {
+                    let item = ListItem::new(format!(" {}", workflow_list_text(workflow)));
+                    if matches!(workflow.availability, WorkflowAvailability::Disabled(_)) {
+                        item.style(Style::new().dim())
+                    } else {
+                        item
+                    }
+                })
                 .collect();
             let list = List::new(items)
                 .highlight_symbol("▶ ")
@@ -1007,10 +1084,12 @@ fn ui(f: &mut Frame, app: &mut App) {
             let mut state = ListState::default();
             state.select(Some(app.selected));
             f.render_stateful_widget(list, rows[0], &mut state);
-            f.render_widget(
-                Paragraph::new(Line::from(" ↑↓ move · Enter select · Esc close").dim()),
-                rows[1],
-            );
+            let footer = if let Some(error) = app.error.as_deref() {
+                Line::from(format!(" {error}")).style(Style::new().red().bold())
+            } else {
+                Line::from(" ↑↓ move · Enter select · Esc close").dim()
+            };
+            f.render_widget(Paragraph::new(footer), rows[1]);
         }
         Screen::Form => {
             let App {
@@ -1405,7 +1484,14 @@ fn main() {
             let workflows = load_workflows(&config);
             println!("Available workflows:");
             for w in &workflows {
-                println!("  {}\t{}", cli_workflow_label(w), w.description);
+                match &w.availability {
+                    WorkflowAvailability::Available => {
+                        println!("  {}\t{}", cli_workflow_label(w), w.description);
+                    }
+                    WorkflowAvailability::Disabled(reason) => {
+                        println!("  [disabled] {}\t{reason}", cli_workflow_label(w));
+                    }
+                }
             }
         }
         "open" => {
@@ -1441,13 +1527,19 @@ fn main() {
                 std::process::exit(1);
             };
             match workflow_by_name(&workflows, name) {
-                Some(w) => match collect(w, &flags) {
-                    Ok(v) => run_workflow(w, &v),
-                    Err(e) => {
-                        eprintln!("{e}");
+                Some(w) => {
+                    if let Err(error) = ensure_workflow_available(w) {
+                        eprintln!("{error}");
                         std::process::exit(1);
                     }
-                },
+                    match collect(w, &flags) {
+                        Ok(v) => run_workflow(w, &v),
+                        Err(e) => {
+                            eprintln!("{e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
                 None => {
                     eprintln!("unknown workflow: {name}");
                     std::process::exit(1);
@@ -1537,12 +1629,14 @@ mod tests {
         Workflow {
             name: name.to_string(),
             title: None,
+            availability_command: None,
             description: String::new(),
             fields,
             command: command.to_string(),
             config_namespace: None,
             dir: PathBuf::new(),
             config: HashMap::new(),
+            availability: WorkflowAvailability::Available,
         }
     }
 
@@ -1980,6 +2074,90 @@ mod tests {
             run_choices(&workflow.fields[0], &workflow, &HashMap::new()).unwrap(),
             ["review"]
         );
+    }
+
+    #[test]
+    fn workflows_without_availability_checks_remain_available() {
+        let mut workflow = workflow("demo", "true", Vec::new());
+
+        evaluate_workflow_availability(&mut workflow);
+
+        assert_eq!(workflow.availability, WorkflowAvailability::Available);
+        assert!(ensure_workflow_available(&workflow).is_ok());
+    }
+
+    #[test]
+    fn availability_checks_receive_namespaced_configuration() {
+        let mut workflow = workflow("demo", "true", Vec::new());
+        workflow.availability_command =
+            Some("test \"$HERDR_WORKFLOW_CONFIG_REQUIRED_VALUE\" = configured".to_string());
+        workflow
+            .config
+            .insert("required_value".to_string(), "configured".to_string());
+
+        evaluate_workflow_availability(&mut workflow);
+
+        assert_eq!(workflow.availability, WorkflowAvailability::Available);
+    }
+
+    #[test]
+    fn availability_failures_use_sanitized_stderr_or_a_generic_fallback() {
+        let mut explained = workflow("explained", "true", Vec::new());
+        explained.availability_command = Some("printf 'Choose a valid path\\n' >&2; exit 1".into());
+        evaluate_workflow_availability(&mut explained);
+        assert_eq!(
+            explained.availability,
+            WorkflowAvailability::Disabled("Choose a valid path".to_string())
+        );
+
+        let mut silent = workflow("silent", "true", Vec::new());
+        silent.availability_command = Some("exit 7".into());
+        evaluate_workflow_availability(&mut silent);
+        assert_eq!(
+            silent.availability,
+            WorkflowAvailability::Disabled("availability check failed (exit 7)".to_string())
+        );
+    }
+
+    #[test]
+    fn availability_spawn_failures_have_a_generic_reason() {
+        let availability = availability_from_output(Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "shell missing",
+        )));
+        assert!(
+            matches!(availability, WorkflowAvailability::Disabled(reason) if reason.contains("could not start"))
+        );
+    }
+
+    #[test]
+    fn disabled_workflows_render_a_reason_and_cannot_open() {
+        let mut workflow = workflow("demo", "true", Vec::new());
+        workflow.title = Some("Friendly Demo".to_string());
+        workflow.availability =
+            WorkflowAvailability::Disabled("configuration is missing".to_string());
+        let mut app = App::new(vec![workflow]);
+
+        let out = dump_snapshot(&mut app, 72, 8);
+        assert!(out.contains("[disabled] Friendly Demo"), "{out}");
+        assert!(out.contains("configuration is missing"), "{out}");
+        assert!(!app.prepare_form());
+        assert!(matches!(app.screen, Screen::List));
+        assert!(app
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("configuration is missing")));
+    }
+
+    #[test]
+    fn disabled_workflows_are_rejected_by_cli_guard() {
+        let mut workflow = workflow("demo", "true", Vec::new());
+        workflow.availability = WorkflowAvailability::Disabled("not ready".to_string());
+
+        let error = ensure_workflow_available(&workflow).unwrap_err();
+
+        assert!(error.contains("demo"));
+        assert!(error.contains("not ready"));
     }
 
     #[test]

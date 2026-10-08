@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   submission revalidation, exact output values, and visible retryable failures.
 - Namespaced, string-valued workflow configuration exposed to workflow and choice
   commands through `HERDR_WORKFLOW_CONFIG_*` environment variables.
+- Optional generic workflow availability checks that retain unavailable workflows
+  as disabled entries with actionable reasons in both TUI and CLI modes.
 
 ## [0.3.0] - 2026-07-10
 
