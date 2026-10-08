@@ -8,22 +8,146 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::fmt;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config, Matcher};
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Terminal;
 use serde::Deserialize;
 use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 use tui_textarea::{CursorMove, TextArea};
-use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
-use nucleo_matcher::{Config, Matcher};
+
+const CONFIG_ERROR_ENV: &str = "HERDR_LAUNCHER_CONFIG_ERROR";
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum Placement {
+    #[default]
+    Split,
+    Overlay,
+}
+
+impl Placement {
+    fn as_str(self) -> &'static str {
+        match self {
+            Placement::Split => "split",
+            Placement::Overlay => "overlay",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct LauncherConfig {
+    #[serde(default)]
+    placement: Placement,
+}
+
+#[derive(Clone, Debug)]
+struct LauncherConfigError {
+    path: PathBuf,
+    detail: String,
+}
+
+impl fmt::Display for LauncherConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid Launcher config at {}: {}",
+            self.path.display(),
+            self.detail
+        )
+    }
+}
+
+fn config_path(plugin_dir: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
+    plugin_dir
+        .map(|dir| dir.join("config.toml"))
+        .or_else(|| home.map(|dir| dir.join(".config/herdr-launcher/config.toml")))
+}
+
+fn launcher_config_path() -> Option<PathBuf> {
+    let plugin_dir = env::var_os("HERDR_PLUGIN_CONFIG_DIR").map(PathBuf::from);
+    let home = env::var_os("HOME").map(PathBuf::from);
+    config_path(plugin_dir.as_deref(), home.as_deref())
+}
+
+fn load_config_from(path: Option<&Path>) -> Result<LauncherConfig, LauncherConfigError> {
+    let Some(path) = path else {
+        return Ok(LauncherConfig::default());
+    };
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(LauncherConfig::default());
+        }
+        Err(error) => {
+            return Err(LauncherConfigError {
+                path: path.to_path_buf(),
+                detail: format!("cannot read file: {error}"),
+            });
+        }
+    };
+    toml::from_str(&text).map_err(|error| LauncherConfigError {
+        path: path.to_path_buf(),
+        detail: format!("{error}; placement must be 'split' or 'overlay'"),
+    })
+}
+
+fn load_config() -> Result<LauncherConfig, LauncherConfigError> {
+    let path = launcher_config_path();
+    load_config_from(path.as_deref())
+}
+
+fn sanitize_env_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn pane_open_args(
+    plugin_id: &str,
+    placement: Placement,
+    cwd: Option<&str>,
+    config_error: Option<&str>,
+) -> Vec<String> {
+    let mut args = vec![
+        "plugin".to_string(),
+        "pane".to_string(),
+        "open".to_string(),
+        "--plugin".to_string(),
+        plugin_id.to_string(),
+        "--entrypoint".to_string(),
+        "launcher-ui".to_string(),
+        "--placement".to_string(),
+        placement.as_str().to_string(),
+    ];
+    if let Some(cwd) = cwd {
+        args.extend(["--cwd".to_string(), cwd.to_string()]);
+    }
+    if let Some(error) = config_error {
+        args.extend([
+            "--env".to_string(),
+            format!("{CONFIG_ERROR_ENV}={}", sanitize_env_value(error)),
+        ]);
+    }
+    args
+}
 
 #[derive(Deserialize, Clone)]
 struct Field {
@@ -77,7 +201,9 @@ fn is_toml(path: &Path) -> bool {
 // makes "first workflow with a name wins" deterministic instead of dependent on the
 // filesystem's whims.
 fn sorted_entries(dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = fs::read_dir(dir) else { return Vec::new() };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
     let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
     paths.sort();
     paths
@@ -99,7 +225,9 @@ fn valid_field_name(name: &str) -> bool {
 // choices_command as $HERDR_WORKFLOW_DIR so a workflow can reference its own
 // bundled helper scripts relocatably.
 fn load_toml_file(path: &Path, dir: &Path, out: &mut Vec<Workflow>) {
-    let Ok(text) = fs::read_to_string(path) else { return };
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
     match toml::from_str::<Workflow>(&text) {
         Ok(mut w) if !out.iter().any(|x| x.name == w.name) => {
             if let Some(bad) = w.fields.iter().find(|f| !valid_field_name(&f.name)) {
@@ -170,6 +298,7 @@ fn run_workflow(wf: &Workflow, values: &HashMap<String, String>) -> ! {
 // ---------- TUI ----------
 
 enum Screen {
+    StartupError,
     List,
     Form,
 }
@@ -318,19 +447,46 @@ fn build_input(field: &Field, workflow_dir: &Path) -> FieldInput {
 
 struct App {
     workflows: Vec<Workflow>,
+    startup_error: Option<String>,
     selected: usize,
     screen: Screen,
-    form_idx: usize,           // index into workflows of the workflow being filled
-    inputs: Vec<FieldInput>,   // current editor per field
+    form_idx: usize,         // index into workflows of the workflow being filled
+    inputs: Vec<FieldInput>, // current editor per field
     field_idx: usize,
-    has_form: bool,            // whether `inputs` holds a form for `form_idx`
+    has_form: bool, // whether `inputs` holds a form for `form_idx`
     error: Option<String>,
     submit: Option<(Workflow, HashMap<String, String>)>,
 }
 
 impl App {
     fn new(workflows: Vec<Workflow>) -> Self {
-        App { workflows, selected: 0, screen: Screen::List, form_idx: 0, inputs: vec![], field_idx: 0, has_form: false, error: None, submit: None }
+        App {
+            workflows,
+            startup_error: None,
+            selected: 0,
+            screen: Screen::List,
+            form_idx: 0,
+            inputs: vec![],
+            field_idx: 0,
+            has_form: false,
+            error: None,
+            submit: None,
+        }
+    }
+
+    fn with_startup_error(error: String) -> Self {
+        App {
+            workflows: Vec::new(),
+            startup_error: Some(error),
+            selected: 0,
+            screen: Screen::StartupError,
+            form_idx: 0,
+            inputs: Vec::new(),
+            field_idx: 0,
+            has_form: false,
+            error: None,
+            submit: None,
+        }
     }
 
     fn move_list(&mut self, delta: isize) {
@@ -348,7 +504,11 @@ impl App {
             self.form_idx = self.selected;
             let wf = &self.workflows[self.form_idx];
             let dir = wf.dir.clone();
-            self.inputs = wf.fields.iter().map(|field| build_input(field, &dir)).collect();
+            self.inputs = wf
+                .fields
+                .iter()
+                .map(|field| build_input(field, &dir))
+                .collect();
             self.field_idx = 0;
             self.has_form = true;
         }
@@ -431,6 +591,29 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(Clear, f.area());
     let area = f.area();
     match app.screen {
+        Screen::StartupError => {
+            let detail = app
+                .startup_error
+                .as_deref()
+                .unwrap_or("invalid Launcher configuration");
+            let rows = Layout::vertical([
+                Constraint::Length(2),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+            f.render_widget(
+                Paragraph::new(" Launcher configuration error").style(Style::new().red().bold()),
+                rows[0],
+            );
+            f.render_widget(
+                Paragraph::new(format!(" {detail}"))
+                    .wrap(Wrap { trim: false })
+                    .style(Style::new().red()),
+                rows[1],
+            );
+            f.render_widget(Paragraph::new(Line::from(" Esc/q close").dim()), rows[2]);
+        }
         Screen::List => {
             // No inner border — herdr already draws the pane frame ("Launcher").
             let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
@@ -451,7 +634,14 @@ fn ui(f: &mut Frame, app: &mut App) {
             );
         }
         Screen::Form => {
-            let App { workflows, form_idx, field_idx, inputs, error, .. } = app;
+            let App {
+                workflows,
+                form_idx,
+                field_idx,
+                inputs,
+                error,
+                ..
+            } = app;
             let wf = &workflows[*form_idx];
 
             let heights: Vec<u16> = inputs
@@ -494,9 +684,21 @@ fn ui(f: &mut Frame, app: &mut App) {
                 let rect = rows[slot + 1];
                 let title = format!(" {label}{req} ");
                 let block = Block::bordered()
-                    .border_type(if focused { BorderType::Thick } else { BorderType::Plain })
-                    .border_style(if focused { Style::new().cyan() } else { Style::new().dim() })
-                    .title(if focused { Span::from(title).bold().cyan() } else { Span::from(title).dim() });
+                    .border_type(if focused {
+                        BorderType::Thick
+                    } else {
+                        BorderType::Plain
+                    })
+                    .border_style(if focused {
+                        Style::new().cyan()
+                    } else {
+                        Style::new().dim()
+                    })
+                    .title(if focused {
+                        Span::from(title).bold().cyan()
+                    } else {
+                        Span::from(title).dim()
+                    });
 
                 match &mut inputs[i] {
                     FieldInput::Area(area) => {
@@ -513,37 +715,51 @@ fn ui(f: &mut Frame, app: &mut App) {
                         let inner_w = rect.width.max(3) - 3;
                         let scroll = input.visual_scroll(inner_w as usize);
                         f.render_widget(
-                            Paragraph::new(input.value()).scroll((0, scroll as u16)).block(block),
+                            Paragraph::new(input.value())
+                                .scroll((0, scroll as u16))
+                                .block(block),
                             rect,
                         );
                         if focused {
-                            let cx = rect.x + 1 + (input.visual_cursor().max(scroll) - scroll) as u16;
+                            let cx =
+                                rect.x + 1 + (input.visual_cursor().max(scroll) - scroll) as u16;
                             f.set_cursor_position((cx, rect.y + 1));
                         }
                     }
                     FieldInput::Select(select) => {
                         if !focused {
-                            f.render_widget(Paragraph::new(select.value.as_str()).block(block), rect);
+                            f.render_widget(
+                                Paragraph::new(select.value.as_str()).block(block),
+                                rect,
+                            );
                             continue;
                         }
                         let block = block.title_bottom(
-                            Line::from(format!(" {} matches ", select.filtered.len())).dim().right_aligned(),
+                            Line::from(format!(" {} matches ", select.filtered.len()))
+                                .dim()
+                                .right_aligned(),
                         );
                         let inner = block.inner(rect);
                         f.render_widget(block, rect);
                         let [search, list] =
-                            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+                            Layout::vertical([Constraint::Length(1), Constraint::Min(1)])
+                                .areas(inner);
 
                         let prefix = "› ";
                         f.render_widget(
                             Paragraph::new(format!("{prefix}{}", select.query.value())),
                             search,
                         );
-                        let cx = search.x + prefix.chars().count() as u16 + select.query.visual_cursor() as u16;
+                        let cx = search.x
+                            + prefix.chars().count() as u16
+                            + select.query.visual_cursor() as u16;
                         f.set_cursor_position((cx, search.y));
 
-                        let items: Vec<ListItem> =
-                            select.filtered.iter().map(|c| ListItem::new(c.as_str())).collect();
+                        let items: Vec<ListItem> = select
+                            .filtered
+                            .iter()
+                            .map(|c| ListItem::new(c.as_str()))
+                            .collect();
                         let mut state = ListState::default();
                         if !select.filtered.is_empty() {
                             state.select(Some(select.sel));
@@ -580,17 +796,22 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
 }
 
-fn run_tui(workflows: Vec<Workflow>) -> Option<(Workflow, HashMap<String, String>)> {
+fn run_app_tui(mut app: App) -> Option<(Workflow, HashMap<String, String>)> {
     let mut terminal = ratatui::init();
     let _ = terminal.clear();
-    let mut app = App::new(workflows);
     loop {
         let _ = terminal.draw(|f| ui(f, &mut app));
-        let Ok(Event::Key(key)) = event::read() else { continue };
+        let Ok(Event::Key(key)) = event::read() else {
+            continue;
+        };
         if key.kind != KeyEventKind::Press {
             continue;
         }
         match app.screen {
+            Screen::StartupError => match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => break,
+                _ => {}
+            },
             Screen::List => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break,
                 KeyCode::Down | KeyCode::Char('j') => app.move_list(1),
@@ -629,6 +850,14 @@ fn run_tui(workflows: Vec<Workflow>) -> Option<(Workflow, HashMap<String, String
     app.submit
 }
 
+fn run_tui(workflows: Vec<Workflow>) -> Option<(Workflow, HashMap<String, String>)> {
+    run_app_tui(App::new(workflows))
+}
+
+fn run_startup_error_tui(error: String) {
+    let _ = run_app_tui(App::with_startup_error(error));
+}
+
 // ---------- non-TUI helpers ----------
 
 // Returns None on EOF (Ctrl+D) or a read error, so callers can abort instead of
@@ -644,7 +873,10 @@ fn prompt(label: &str) -> Option<String> {
     }
 }
 
-fn collect(wf: &Workflow, flags: &HashMap<String, String>) -> Result<HashMap<String, String>, String> {
+fn collect(
+    wf: &Workflow,
+    flags: &HashMap<String, String>,
+) -> Result<HashMap<String, String>, String> {
     let interactive = io::stdin().is_terminal();
     collect_fields(wf, flags, interactive, prompt)
 }
@@ -666,7 +898,11 @@ fn collect_fields(
             None => Vec::new(),
         };
         let label = f.prompt.clone().unwrap_or_else(|| f.name.clone());
-        let hint = if choices.is_empty() { String::new() } else { format!(" [{}]", choices.join(", ")) };
+        let hint = if choices.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", choices.join(", "))
+        };
 
         let val = if let Some(v) = flags.get(&f.name) {
             v.clone()
@@ -685,7 +921,10 @@ fn collect_fields(
         } else if let Some(d) = &f.default {
             d.clone()
         } else if f.required {
-            return Err(format!("missing required field --{} (no TTY for prompt)", f.name));
+            return Err(format!(
+                "missing required field --{} (no TTY for prompt)",
+                f.name
+            ));
         } else {
             String::new()
         };
@@ -760,10 +999,14 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let (positionals, flags) = parse_args(&args);
     let cmd = positionals.first().map(String::as_str).unwrap_or("list");
-    let workflows = load_workflows();
 
     match cmd {
         "list" => {
+            if let Err(error) = load_config() {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+            let workflows = load_workflows();
             println!("Available workflows:");
             for w in &workflows {
                 println!("  {}\t{}", w.name, w.description);
@@ -775,13 +1018,14 @@ fn main() {
                 eprintln!("HERDR_PLUGIN_ID not set — run via the herdr action");
                 std::process::exit(1);
             };
+            let (placement, config_error) = match load_config() {
+                Ok(config) => (config.placement, None),
+                Err(error) => (Placement::Split, Some(error.to_string())),
+            };
+            let cwd = ctx_cwd();
+            let args = pane_open_args(&id, placement, cwd.as_deref(), config_error.as_deref());
             let mut cmd = Command::new(herdr);
-            cmd.args(["plugin", "pane", "open", "--plugin", &id, "--entrypoint", "launcher-ui", "--placement", "split", "--direction", "right"]);
-            // Carry the invoking workspace's cwd into the overlay pane (its own cwd is
-            // the plugin dir), so workflows like new-task target the right repo.
-            if let Some(cwd) = ctx_cwd() {
-                cmd.args(["--cwd", &cwd]);
-            }
+            cmd.args(args);
             match cmd.status() {
                 Ok(s) => std::process::exit(s.code().unwrap_or(0)),
                 Err(e) => {
@@ -791,6 +1035,11 @@ fn main() {
             }
         }
         "run" => {
+            if let Err(error) = load_config() {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+            let workflows = load_workflows();
             let Some(name) = positionals.get(1) else {
                 eprintln!("usage: herdr-launcher run <name>");
                 std::process::exit(1);
@@ -810,8 +1059,27 @@ fn main() {
             }
         }
         "pick" => {
+            if let Ok(error) = env::var(CONFIG_ERROR_ENV) {
+                if !io::stdout().is_terminal() {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+                run_startup_error_tui(error);
+                return;
+            }
+            if let Err(error) = load_config() {
+                if !io::stdout().is_terminal() {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+                run_startup_error_tui(error.to_string());
+                return;
+            }
+            let workflows = load_workflows();
             if workflows.is_empty() {
-                println!("No workflows found. Add .toml files to ~/.config/herdr-launcher/workflows/");
+                println!(
+                    "No workflows found. Add .toml files to ~/.config/herdr-launcher/workflows/"
+                );
                 return;
             }
             if !io::stdout().is_terminal() {
@@ -823,6 +1091,7 @@ fn main() {
             }
         }
         "__snapshot" => {
+            let workflows = load_workflows();
             let mut app = App::new(workflows);
             println!("--- list screen ---");
             print!("{}", dump_snapshot(&mut app, 72, 11));
@@ -848,7 +1117,12 @@ mod tests {
         field_with(name, required, None, None)
     }
 
-    fn field_with(name: &str, required: bool, default: Option<&str>, choices_command: Option<&str>) -> Field {
+    fn field_with(
+        name: &str,
+        required: bool,
+        default: Option<&str>,
+        choices_command: Option<&str>,
+    ) -> Field {
         Field {
             name: name.to_string(),
             prompt: None,
@@ -882,7 +1156,9 @@ mod tests {
 
     #[test]
     fn parse_args_splits_positionals_and_flags() {
-        let args = ["run", "wf", "--x", "1", "--y=2", "--flag"].map(String::from).to_vec();
+        let args = ["run", "wf", "--x", "1", "--y=2", "--flag"]
+            .map(String::from)
+            .to_vec();
         let (positionals, flags) = parse_args(&args);
         assert_eq!(positionals, vec!["run", "wf"]);
         assert_eq!(flags.get("x"), Some(&"1".to_string()));
@@ -895,7 +1171,10 @@ mod tests {
         let heights = vec![3u16; 9];
         for focus in 0..heights.len() {
             let (start, end) = visible_window(&heights, focus, 10);
-            assert!(start <= focus && focus < end, "focus {focus} not in [{start},{end})");
+            assert!(
+                start <= focus && focus < end,
+                "focus {focus} not in [{start},{end})"
+            );
             let used: u16 = heights[start..end].iter().sum();
             assert!(used <= 10, "window {used} rows exceeds avail");
         }
@@ -920,7 +1199,10 @@ mod tests {
         load_dir(&dir, &mut out);
 
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].command, "echo a", "a.toml sorts first, so it wins deterministically");
+        assert_eq!(
+            out[0].command, "echo a",
+            "a.toml sorts first, so it wins deterministically"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -931,7 +1213,10 @@ mod tests {
         app.open_form();
         app.field_idx = 8;
         let out = dump_snapshot(&mut app, 60, 14);
-        assert!(out.contains("f8"), "last field must be on screen when focused:\n{out}");
+        assert!(
+            out.contains("f8"),
+            "last field must be on screen when focused:\n{out}"
+        );
     }
 
     #[test]
@@ -940,21 +1225,30 @@ mod tests {
         app.open_form();
         app.try_submit();
         assert!(app.submit.is_none());
-        assert!(app.error.is_some(), "empty required field must surface an error");
+        assert!(
+            app.error.is_some(),
+            "empty required field must surface an error"
+        );
     }
 
     #[test]
     fn collect_aborts_on_eof_instead_of_looping() {
         let wf = workflow("demo", "true", vec![field("name", true)]);
         let err = collect_fields(&wf, &HashMap::new(), true, |_| None).unwrap_err();
-        assert!(err.contains("EOF"), "EOF on a required field must abort, got: {err}");
+        assert!(
+            err.contains("EOF"),
+            "EOF on a required field must abort, got: {err}"
+        );
     }
 
     #[test]
     fn collect_reprompts_required_field_then_accepts_value() {
         let wf = workflow("demo", "true", vec![field("name", true)]);
         let mut replies = vec![Some(String::new()), Some("finally".to_string())].into_iter();
-        let out = collect_fields(&wf, &HashMap::new(), true, move |_| replies.next().flatten()).unwrap();
+        let out = collect_fields(&wf, &HashMap::new(), true, move |_| {
+            replies.next().flatten()
+        })
+        .unwrap();
         assert_eq!(out.get("name"), Some(&"finally".to_string()));
     }
 
@@ -967,14 +1261,22 @@ mod tests {
 
     #[test]
     fn collect_falls_back_to_default_without_tty() {
-        let wf = workflow("demo", "true", vec![field_with("lang", false, Some("en"), None)]);
+        let wf = workflow(
+            "demo",
+            "true",
+            vec![field_with("lang", false, Some("en"), None)],
+        );
         let out = collect_fields(&wf, &HashMap::new(), false, |_| None).unwrap();
         assert_eq!(out.get("lang"), Some(&"en".to_string()));
     }
 
     #[test]
     fn collect_rejects_value_outside_choices() {
-        let wf = workflow("demo", "true", vec![field_with("c", true, None, Some("printf 'a\\nb\\n'"))]);
+        let wf = workflow(
+            "demo",
+            "true",
+            vec![field_with("c", true, None, Some("printf 'a\\nb\\n'"))],
+        );
         let mut bad = HashMap::new();
         bad.insert("c".to_string(), "zzz".to_string());
         let err = collect_fields(&wf, &bad, false, |_| None).unwrap_err();
@@ -994,7 +1296,10 @@ mod tests {
             s.handle(KeyEvent::from(KeyCode::Char(c)));
         }
         assert!(s.filtered.is_empty());
-        assert_eq!(s.value, "", "a zero-match query must not submit a stale choice");
+        assert_eq!(
+            s.value, "",
+            "a zero-match query must not submit a stale choice"
+        );
     }
 
     #[test]
@@ -1015,10 +1320,102 @@ mod tests {
 
         app.screen = Screen::List;
         app.open_form();
-        assert_eq!(app.inputs[0].value(), "typed", "re-entering the same workflow keeps input");
+        assert_eq!(
+            app.inputs[0].value(),
+            "typed",
+            "re-entering the same workflow keeps input"
+        );
 
         app.selected = 1;
         app.open_form();
-        assert_eq!(app.inputs[0].value(), "", "switching workflows rebuilds the form");
+        assert_eq!(
+            app.inputs[0].value(),
+            "",
+            "switching workflows rebuilds the form"
+        );
+    }
+
+    #[test]
+    fn config_path_prefers_the_herdr_plugin_directory() {
+        let plugin = Path::new("/tmp/herdr-plugin-config");
+        let home = Path::new("/tmp/home");
+        assert_eq!(
+            config_path(Some(plugin), Some(home)),
+            Some(plugin.join("config.toml"))
+        );
+        assert_eq!(
+            config_path(None, Some(home)),
+            Some(home.join(".config/herdr-launcher/config.toml"))
+        );
+    }
+
+    #[test]
+    fn missing_config_defaults_to_split() {
+        let path = env::temp_dir().join(format!("hl-missing-config-{}", std::process::id()));
+        let config = load_config_from(Some(path.as_path())).unwrap();
+        assert_eq!(config.placement, Placement::Split);
+    }
+
+    #[test]
+    fn config_accepts_split_and_overlay() {
+        let path = env::temp_dir().join(format!("hl-valid-config-{}", std::process::id()));
+
+        fs::write(&path, "placement = \"split\"\n").unwrap();
+        assert_eq!(
+            load_config_from(Some(path.as_path())).unwrap().placement,
+            Placement::Split
+        );
+
+        fs::write(&path, "placement = \"overlay\"\n").unwrap();
+        assert_eq!(
+            load_config_from(Some(path.as_path())).unwrap().placement,
+            Placement::Overlay
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pane_open_args_use_placement_and_preserve_cwd_without_direction() {
+        let args = pane_open_args("plugin.id", Placement::Overlay, Some("/repo"), None);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--placement", "overlay"]));
+        assert!(args.windows(2).any(|pair| pair == ["--cwd", "/repo"]));
+        assert!(!args.contains(&"--direction"));
+    }
+
+    #[test]
+    fn invalid_config_uses_safe_split_and_visible_error_transport() {
+        let path = env::temp_dir().join(format!("hl-invalid-config-{}", std::process::id()));
+        fs::write(&path, "placement = \"popup\"\n").unwrap();
+        let error = load_config_from(Some(path.as_path()))
+            .unwrap_err()
+            .to_string();
+        let args = pane_open_args("plugin.id", Placement::Split, None, Some(&error));
+
+        assert!(args.windows(2).any(|pair| pair == ["--placement", "split"]));
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == "--env"
+                && pair[1].starts_with("HERDR_LAUNCHER_CONFIG_ERROR=")
+                && pair[1].contains("split")
+                && pair[1].contains("overlay")
+        }));
+        assert!(!args.contains(&"--direction".to_string()));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn startup_error_snapshot_is_blocking_and_actionable() {
+        let mut app = App::with_startup_error(
+            "invalid Launcher config at /tmp/config.toml: placement must be split or overlay"
+                .to_string(),
+        );
+        let out = dump_snapshot(&mut app, 80, 10);
+        assert!(out.contains("Launcher configuration error"), "{out}");
+        assert!(out.contains("/tmp/config.toml"), "{out}");
+        assert!(out.contains("split or overlay"), "{out}");
+        assert!(out.contains("Esc/q close"), "{out}");
     }
 }

@@ -27,6 +27,28 @@ herdr plugin install arjenblokzijl/herdr-launcher
 In herdr, run the **"Launcher: pick & run"** action (or bind a key to it) to open
 the picker. As a CLI: `herdr-launcher list`, `herdr-launcher run <name>`.
 
+## Configuration
+
+Launcher reads `config.toml` from its Herdr plugin config directory. Print that
+directory with:
+
+```bash
+herdr plugin config-dir arjenblokzijl.herdr-launcher
+```
+
+When the binary runs outside Herdr, it falls back to
+`~/.config/herdr-launcher/config.toml`. The file is optional:
+
+```toml
+# "split" (default) or "overlay"
+placement = "overlay"
+```
+
+An absent file defaults to a split pane. Invalid TOML or any placement other
+than `split` or `overlay` opens a safe split pane containing the config path
+and error; normal workflows cannot run from that diagnostic screen. Close and
+reopen Launcher after changing the file.
+
 ## The picker
 
 - **↑↓ / Enter** to choose a workflow, then a boxed field form.
