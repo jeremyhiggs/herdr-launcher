@@ -450,9 +450,13 @@ fn evaluate_workflow_availability(workflow: &mut Workflow) {
         workflow.availability = WorkflowAvailability::Available;
         return;
     };
-    let output = shell_command(&command, workflow_environment(workflow, &HashMap::new()))
-        .stdout(Stdio::null())
-        .output();
+    let output = shell_command(
+        &command,
+        workflow,
+        workflow_environment(workflow, &HashMap::new()),
+    )
+    .stdout(Stdio::null())
+    .output();
     workflow.availability = availability_from_output(output);
 }
 
@@ -479,10 +483,6 @@ fn workflow_environment(
     values: &HashMap<String, String>,
 ) -> HashMap<String, String> {
     let mut environment = HashMap::new();
-    environment.insert(
-        "HERDR_WORKFLOW_DIR".to_string(),
-        workflow.dir.to_string_lossy().into_owned(),
-    );
     for (key, value) in &workflow.config {
         environment.insert(
             format!("HERDR_WORKFLOW_CONFIG_{}", key.to_ascii_uppercase()),
@@ -513,11 +513,16 @@ fn is_launcher_environment(key: &OsStr) -> bool {
     key.starts_with("HERDR_FIELD_") || key.starts_with("HERDR_WORKFLOW_CONFIG_")
 }
 
-fn shell_command(script: &str, environment: HashMap<String, String>) -> Command {
+fn shell_command(
+    script: &str,
+    workflow: &Workflow,
+    environment: HashMap<String, String>,
+) -> Command {
     let mut command = Command::new("sh");
     command.arg("-c").arg(script);
     command.env_clear();
     command.envs(env::vars_os().filter(|(key, _)| !is_launcher_environment(key)));
+    command.env("HERDR_WORKFLOW_DIR", &workflow.dir);
     command.envs(environment);
     command
 }
@@ -526,7 +531,7 @@ fn run_workflow(wf: &Workflow, values: &HashMap<String, String>) -> ! {
     // The command reads field values from $HERDR_FIELD_<name> (and $HERDR_WORKFLOW_DIR
     // for bundled scripts). Values are passed via the environment, never interpolated
     // into the command string, so a field containing shell metacharacters can't inject.
-    let mut command = shell_command(&wf.command, workflow_environment(wf, values));
+    let mut command = shell_command(&wf.command, wf, workflow_environment(wf, values));
     match command.status() {
         Ok(s) => std::process::exit(s.code().unwrap_or(0)),
         Err(e) => {
@@ -690,14 +695,18 @@ fn run_choices(
     let Some(command) = field.choices_command.as_deref() else {
         return Ok(Vec::new());
     };
-    let output = shell_command(command, choice_environment(workflow, field, values))
-        .output()
-        .map_err(|error| {
-            format!(
-                "failed to start choices command for '{}': {error}",
-                field.name
-            )
-        })?;
+    let output = shell_command(
+        command,
+        workflow,
+        choice_environment(workflow, field, values),
+    )
+    .output()
+    .map_err(|error| {
+        format!(
+            "failed to start choices command for '{}': {error}",
+            field.name
+        )
+    })?;
     if !output.status.success() {
         let detail = sanitize_env_value(String::from_utf8_lossy(&output.stderr).trim());
         let status = output
@@ -844,6 +853,27 @@ impl App {
             return;
         }
         self.field_idx = (((self.field_idx as isize) + delta).rem_euclid(n)) as usize;
+    }
+
+    fn choice_needs_refresh(&self, index: usize) -> bool {
+        let workflow = &self.workflows[self.form_idx];
+        let field = &workflow.fields[index];
+        if field.choices_command.is_none() {
+            return false;
+        }
+        let signature = dependency_signature(field, &self.form_values());
+        matches!(
+            self.inputs.get(index),
+            Some(FieldInput::Select(select))
+                if select.dirty || select.dependency_signature.as_ref() != Some(&signature)
+        )
+    }
+
+    fn choices_need_refresh(&self) -> bool {
+        (0..self.inputs.len()).any(|index| self.choice_needs_refresh(index))
+    }
+
+    fn refresh_current_choice(&mut self) {
         if let Err(error) = self.refresh_choice(self.field_idx) {
             self.error = Some(error);
         }
@@ -1283,24 +1313,45 @@ fn run_app_tui(mut app: App) -> Option<(Workflow, HashMap<String, String>)> {
             Screen::Form => {
                 app.error = None;
                 let multiline = app.current_multiline();
+                let mut refresh_current = false;
+                let mut submit = false;
                 match key.code {
                     KeyCode::Esc => app.screen = Screen::List,
-                    KeyCode::Tab => app.move_field(1),
-                    KeyCode::BackTab => app.move_field(-1),
+                    KeyCode::Tab => {
+                        app.move_field(1);
+                        refresh_current = true;
+                    }
+                    KeyCode::BackTab => {
+                        app.move_field(-1);
+                        refresh_current = true;
+                    }
                     KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        app.try_submit()
+                        submit = true;
                     }
                     KeyCode::Enter if !multiline => {
                         let last = app.field_idx + 1 >= app.workflows[app.form_idx].fields.len();
                         if last {
-                            app.try_submit();
+                            submit = true;
                         } else {
                             app.move_field(1);
+                            refresh_current = true;
                         }
                     }
                     _ if !app.inputs.is_empty() => app.handle_current_input(key),
                     _ => {}
                 }
+                let show_loading = (submit && app.choices_need_refresh())
+                    || (refresh_current && app.choice_needs_refresh(app.field_idx));
+                if show_loading {
+                    app.loading_choices = true;
+                    let _ = terminal.draw(|frame| ui(frame, &mut app));
+                }
+                if submit {
+                    app.try_submit();
+                } else if refresh_current {
+                    app.refresh_current_choice();
+                }
+                app.loading_choices = false;
             }
         }
         if app.submit.is_some() {
@@ -1330,7 +1381,7 @@ fn prompt(label: &str) -> Option<String> {
     let mut s = String::new();
     match io::stdin().read_line(&mut s) {
         Ok(0) | Err(_) => None,
-        Ok(_) => Some(s.trim().to_string()),
+        Ok(_) => Some(s.trim_end_matches(['\r', '\n']).to_string()),
     }
 }
 
@@ -1373,9 +1424,16 @@ fn collect_fields(
             v.clone()
         } else if interactive {
             let aborted = || format!("aborted while reading --{} (EOF)", f.name);
-            let mut v = ask(&format!("{label}{hint}")).ok_or_else(aborted)?;
+            let normalize = |value: String| {
+                if choices.is_some() {
+                    value
+                } else {
+                    value.trim().to_string()
+                }
+            };
+            let mut v = normalize(ask(&format!("{label}{hint}")).ok_or_else(aborted)?);
             while f.required && v.is_empty() && f.default.is_none() {
-                v = ask(&format!("{label}{hint} (required)")).ok_or_else(aborted)?;
+                v = normalize(ask(&format!("{label}{hint} (required)")).ok_or_else(aborted)?);
             }
             if v.is_empty() {
                 if let Some(d) = &f.default {
@@ -1840,6 +1898,32 @@ mod tests {
     }
 
     #[test]
+    fn collect_preserves_space_padded_interactive_choices() {
+        let wf = workflow(
+            "demo",
+            "true",
+            vec![field_with("choice", true, None, Some("printf ' repo \\n'"))],
+        );
+
+        let out =
+            collect_fields(&wf, &HashMap::new(), true, |_| Some(" repo ".to_string())).unwrap();
+
+        assert_eq!(out.get("choice").map(String::as_str), Some(" repo "));
+    }
+
+    #[test]
+    fn collect_still_trims_interactive_free_text() {
+        let wf = workflow("demo", "true", vec![field("name", true)]);
+
+        let out = collect_fields(&wf, &HashMap::new(), true, |_| {
+            Some("  Jeremy  ".to_string())
+        })
+        .unwrap();
+
+        assert_eq!(out.get("name").map(String::as_str), Some("Jeremy"));
+    }
+
+    #[test]
     fn select_clears_value_when_nothing_matches() {
         let mut s = SelectField::new(vec!["alpha".into(), "beta".into()], None);
         assert_eq!(s.value, "alpha", "first choice is committed on open");
@@ -2065,6 +2149,7 @@ mod tests {
 
         let command_output = shell_command(
             &workflow.command,
+            &workflow,
             workflow_environment(&workflow, &HashMap::new()),
         )
         .output()
@@ -2074,6 +2159,26 @@ mod tests {
             run_choices(&workflow.fields[0], &workflow, &HashMap::new()).unwrap(),
             ["review"]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workflow_directory_environment_preserves_non_utf8_paths() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let mut workflow = workflow("demo", "true", Vec::new());
+        workflow.dir =
+            env::temp_dir().join(std::ffi::OsString::from_vec(vec![b'h', b'l', b'-', 0xff]));
+
+        let output = shell_command(
+            "printf '%s' \"$HERDR_WORKFLOW_DIR\"",
+            &workflow,
+            workflow_environment(&workflow, &HashMap::new()),
+        )
+        .output()
+        .unwrap();
+
+        assert_eq!(output.stdout, workflow.dir.as_os_str().as_bytes());
     }
 
     #[test]
@@ -2226,6 +2331,48 @@ mod tests {
         app.try_submit();
         let (_, values) = app.submit.expect("submit should refresh dependent choices");
         assert_eq!(values.get("branch"), Some(&"beta-branch".to_string()));
+    }
+
+    #[test]
+    fn dependent_refresh_can_render_loading_before_running() {
+        let marker = env::temp_dir().join(format!("hl-dependent-loading-{}", std::process::id()));
+        let _ = fs::remove_file(&marker);
+        let mut branch = field_with(
+            "branch",
+            true,
+            None,
+            Some(&format!(
+                "printf ran > '{}'; printf '%s-branch\\n' \"$HERDR_FIELD_project\"",
+                marker.display()
+            )),
+        );
+        branch.depends_on = vec!["project".to_string()];
+        let workflow = workflow(
+            "demo",
+            "true",
+            vec![
+                field_with("project", true, None, Some("printf 'alpha\\nbeta\\n'")),
+                branch,
+            ],
+        );
+        let mut app = App::new(vec![workflow]);
+        app.open_form();
+        let _ = fs::remove_file(&marker);
+
+        app.field_idx = 0;
+        app.handle_current_input(KeyEvent::from(KeyCode::Down));
+        app.move_field(1);
+        assert!(app.choice_needs_refresh(app.field_idx));
+        app.loading_choices = true;
+        let out = dump_snapshot(&mut app, 72, 14);
+        assert!(out.contains("Loading choices"), "{out}");
+        assert!(!marker.exists(), "choice command ran before loading draw");
+
+        app.refresh_current_choice();
+        app.loading_choices = false;
+        assert!(marker.exists());
+        assert_eq!(app.inputs[1].value(), "beta-branch");
+        let _ = fs::remove_file(marker);
     }
 
     #[test]
