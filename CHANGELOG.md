@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Launcher configuration at the Herdr plugin config directory, with `split` and
   `overlay` pane placement and an in-pane diagnostic for invalid configuration.
+- Optional workflow titles for friendly picker labels while preserving stable names
+  for CLI lookup and future configuration.
 
 ## [0.3.0] - 2026-07-10
 

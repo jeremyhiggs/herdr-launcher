@@ -168,12 +168,43 @@ struct Field {
 struct Workflow {
     name: String,
     #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
     description: String,
     #[serde(default)]
     fields: Vec<Field>,
     command: String,
     #[serde(skip)]
     dir: PathBuf,
+}
+
+impl Workflow {
+    fn label(&self) -> &str {
+        self.title
+            .as_deref()
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or(&self.name)
+    }
+}
+
+fn cli_workflow_label(workflow: &Workflow) -> String {
+    if workflow.label() == workflow.name {
+        workflow.name.clone()
+    } else {
+        format!("{} [{}]", workflow.label(), workflow.name)
+    }
+}
+
+fn sort_workflows(workflows: &mut [Workflow]) {
+    workflows.sort_by(|left, right| {
+        left.label()
+            .cmp(right.label())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+}
+
+fn workflow_by_name<'a>(workflows: &'a [Workflow], name: &str) -> Option<&'a Workflow> {
+    workflows.iter().find(|workflow| workflow.name == name)
 }
 
 fn workflow_dirs() -> Vec<PathBuf> {
@@ -272,7 +303,7 @@ fn load_workflows() -> Vec<Workflow> {
     for dir in workflow_dirs() {
         load_dir(&dir, &mut out);
     }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
+    sort_workflows(&mut out);
     out
 }
 
@@ -620,7 +651,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             let items: Vec<ListItem> = app
                 .workflows
                 .iter()
-                .map(|w| ListItem::new(format!(" {}  —  {}", w.name, w.description)))
+                .map(|w| ListItem::new(format!(" {}  —  {}", w.label(), w.description)))
                 .collect();
             let list = List::new(items)
                 .highlight_symbol("▶ ")
@@ -670,7 +701,7 @@ fn ui(f: &mut Frame, app: &mut App) {
 
             f.render_widget(
                 Paragraph::new(vec![
-                    Line::from(format!(" {}", wf.name)).bold(),
+                    Line::from(format!(" {}", wf.label())).bold(),
                     Line::from(format!(" {}", wf.description)).dim(),
                 ]),
                 rows[0],
@@ -1009,7 +1040,7 @@ fn main() {
             let workflows = load_workflows();
             println!("Available workflows:");
             for w in &workflows {
-                println!("  {}\t{}", w.name, w.description);
+                println!("  {}\t{}", cli_workflow_label(w), w.description);
             }
         }
         "open" => {
@@ -1044,7 +1075,7 @@ fn main() {
                 eprintln!("usage: herdr-launcher run <name>");
                 std::process::exit(1);
             };
-            match workflows.iter().find(|w| &w.name == name) {
+            match workflow_by_name(&workflows, name) {
                 Some(w) => match collect(w, &flags) {
                     Ok(v) => run_workflow(w, &v),
                     Err(e) => {
@@ -1136,6 +1167,7 @@ mod tests {
     fn workflow(name: &str, command: &str, fields: Vec<Field>) -> Workflow {
         Workflow {
             name: name.to_string(),
+            title: None,
             description: String::new(),
             fields,
             command: command.to_string(),
@@ -1152,6 +1184,60 @@ mod tests {
         assert!(!valid_field_name("1branch"));
         assert!(!valid_field_name(""));
         assert!(!valid_field_name("has space"));
+    }
+
+    #[test]
+    fn workflow_title_is_an_optional_display_label() {
+        let mut workflow = workflow("stable-id", "true", Vec::new());
+        assert_eq!(workflow.label(), "stable-id");
+        assert_eq!(cli_workflow_label(&workflow), "stable-id");
+
+        workflow.title = Some("Friendly title".into());
+        assert_eq!(workflow.label(), "Friendly title");
+        assert_eq!(workflow.name, "stable-id");
+        assert_eq!(cli_workflow_label(&workflow), "Friendly title [stable-id]");
+
+        workflow.title = Some("   ".into());
+        assert_eq!(workflow.label(), "stable-id");
+    }
+
+    #[test]
+    fn workflow_title_renders_in_the_picker() {
+        let mut workflow = workflow("stable-id", "true", Vec::new());
+        workflow.title = Some("Friendly title".into());
+        let mut app = App::new(vec![workflow]);
+        let out = dump_snapshot(&mut app, 60, 8);
+        assert!(out.contains("Friendly title"), "{out}");
+        assert!(!out.contains("stable-id"), "{out}");
+    }
+
+    #[test]
+    fn workflow_lookup_uses_the_stable_name() {
+        let mut workflow = workflow("stable-id", "true", Vec::new());
+        workflow.title = Some("Friendly title".into());
+        let workflows = vec![workflow];
+
+        assert!(workflow_by_name(&workflows, "stable-id").is_some());
+        assert!(workflow_by_name(&workflows, "Friendly title").is_none());
+    }
+
+    #[test]
+    fn workflows_sort_by_display_label_then_stable_name() {
+        let mut zebra = workflow("a-id", "true", Vec::new());
+        zebra.title = Some("Zebra".into());
+        let mut alpha_b = workflow("b-id", "true", Vec::new());
+        alpha_b.title = Some("Alpha".into());
+        let mut alpha_a = workflow("a-alpha-id", "true", Vec::new());
+        alpha_a.title = Some("Alpha".into());
+        let mut workflows = vec![zebra, alpha_b, alpha_a];
+
+        sort_workflows(&mut workflows);
+
+        let names: Vec<&str> = workflows
+            .iter()
+            .map(|workflow| workflow.name.as_str())
+            .collect();
+        assert_eq!(names, ["a-alpha-id", "b-id", "a-id"]);
     }
 
     #[test]

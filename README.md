@@ -63,6 +63,7 @@ A workflow is a `.toml` file — either `name.toml` directly, or a self-containe
 
 ```toml
 name = "greet"
+title = "Say Hello" # optional display label; `name` remains the CLI identifier
 description = "Prints a greeting"
 # Field values are passed via $HERDR_FIELD_<name> (never interpolated into the
 # shell — no injection). $HERDR_WORKFLOW_DIR points at this workflow's folder.
@@ -78,6 +79,10 @@ name = "lang"
 prompt = "Language (en/nl)"
 default = "en"
 ```
+
+`name` is the stable identifier used by `run` and configuration. An optional,
+non-empty `title` is shown in the picker. `list` includes the stable name in
+brackets when it differs from the title, so its output remains directly runnable.
 
 Field keys:
 
