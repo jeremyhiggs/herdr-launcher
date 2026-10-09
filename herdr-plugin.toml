@@ -9,8 +9,9 @@ platforms = ["macos", "linux"]
 [[build]]
 command = ["sh", "build.sh"]
 
-# Open the picker using the placement from config.toml. Wrapped in `sh -c` so
-# $HERDR_PLUGIN_ROOT (set by herdr for plugin processes) expands at runtime.
+# Open the picker using the placement from config.toml (split by default).
+# Wrapped in `sh -c` so $HERDR_PLUGIN_ROOT (set by herdr for plugin processes)
+# expands at runtime.
 [[actions]]
 id = "pick"
 title = "Launcher: pick & run"
